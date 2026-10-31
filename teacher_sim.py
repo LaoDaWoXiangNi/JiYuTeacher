@@ -75,6 +75,11 @@ def setup_logging():
 
     logger.info('日志系统初始化完成，级别=%s，log 文件：%s',
                 logging.getLevelName(FILE_LOG_LEVEL), LOG_PATH)
+    try:
+        from gui_events import install_log_bridge
+        install_log_bridge(logger)
+    except ImportError:
+        pass
     return logger
 
 
@@ -2133,36 +2138,26 @@ def handle_tnal(d, sip):
                  sip, frame_seq, state['got'], total, max(0, written - previous))
 
     if state['got'] >= total:
-        idx = 0
-        while True:
-            fn = os.path.join(LOG_DIR, f'preview_{sip.replace(".", "_")}_{idx}.jpg')
-            if not os.path.exists(fn):
-                break
-            idx += 1
-        try:
-            with open(fn, 'wb') as f:
-                f.write(state['buf'])
-            logger.info('[Preview] 已保存原图 %s (%d bytes)', fn, total)
-        except Exception as e:
-            logger.error('[Preview] 保存原图 %s 失败：%s', fn, e, exc_info=True)
-            return
-
         # 极域学生端 JPEG 是 bottom-up DIB + 仅色度反相（Cb/Cr 反相，Y 不变）。
         try:
-            fixed_fn = fn.replace('.jpg', '_fixed.jpg')
             img = Image.open(io.BytesIO(state['buf']))
             if img.mode != 'RGB':
                 img = img.convert('RGB')
-            img = img.transpose(Image.FLIP_TOP_BOTTOM)
+            img = img.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
             ycbcr = img.convert('YCbCr')
             y, cb, cr = ycbcr.split()
-            cb = ImageOps.invert(cb)
-            cr = ImageOps.invert(cr)
-            img = Image.merge('YCbCr', (y, cb, cr)).convert('RGB')
-            img.save(fixed_fn, 'JPEG', quality=95)
-            logger.info('[Preview] 已保存修复图 %s', fixed_fn)
+            img = Image.merge('YCbCr', (y, ImageOps.invert(cb), ImageOps.invert(cr))).convert('RGB')
+            if os.environ.get('TEACHER_SAVE_PREVIEWS', '0') == '1':
+                fn = os.path.join(LOG_DIR, f'preview_{sip.replace(".", "_")}_latest.jpg')
+                img.save(fn, 'JPEG', quality=95)
+                logger.info('[Preview] 已保存修复图 %s', fn)
+            try:
+                from gui_events import preview_events
+                preview_events.publish(sip, img.copy())
+            except ImportError:
+                pass
         except Exception as e:
-            logger.error('[Preview] 修复图保存失败：%s', e, exc_info=True)
+            logger.error('[Preview] 图像修复失败：%s', e, exc_info=True)
 
         logger.info('[Preview] %s 接收完成', sip)
         completed_preview_frames[sip] = frame_seq
@@ -3113,18 +3108,35 @@ def command_loop():
 
 # -------------------- 启动 --------------------
 
-spawn_log_window()
-logger.info('启动 4 个后台线程')
-threading.Thread(target=broadcast, name='broadcast', daemon=True).start()
-threading.Thread(target=session_anno, name='session_anno', daemon=True).start()
-threading.Thread(target=session_recv, name='session_recv', daemon=True).start()
-threading.Thread(target=main_recv, name='main_recv', daemon=True).start()
+def start_background_threads():
+    logger.info('启动 4 个后台线程')
+    for name, target in (
+        ('broadcast', broadcast), ('session_anno', session_anno),
+        ('session_recv', session_recv), ('main_recv', main_recv),
+    ):
+        threading.Thread(target=target, name=name, daemon=True).start()
 
-command_loop()
 
-running = False
-for sip in list(remote_views):
-    stop_remote_view(sip, notify=False)
-for sip in list(remote_controls):
-    stop_remote_control(sip, notify=False)
-logger.info('程序退出。students=%s, previews=%s', list(students.keys()), list(previews.keys()))
+def shutdown():
+    global running
+    running = False
+    for timer in list(blackscreen_timers.values()):
+        timer.cancel()
+    blackscreen_timers.clear()
+    for sip in list(remote_views):
+        stop_remote_view(sip, notify=False)
+    for sip in list(remote_controls):
+        stop_remote_control(sip, notify=False)
+    for network_socket in (sock, sock2):
+        try:
+            network_socket.close()
+        except OSError:
+            pass
+    logger.info('程序退出。students=%s, previews=%s', list(students.keys()), list(previews.keys()))
+
+
+if __name__ == '__main__':
+    spawn_log_window()
+    start_background_threads()
+    command_loop()
+    shutdown()

@@ -1,0 +1,10 @@
+temp/
+__pycache__/
+*.py[cod]
+*.log
+.venv/
+venv/
+build/
+dist/
+.idea/
+.vscode/
