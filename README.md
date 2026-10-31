@@ -43,6 +43,16 @@ python teacher_gui.py
 
 启动 GUI 时会绑定协议端口并发送教师端发现宣告。仅进行界面开发时，可设置 `QT_QPA_PLATFORM=offscreen` 做离屏验证，不要把离屏测试当成协议实机验证。
 
+## 一键构建独立 EXE
+
+```bash
+python build.py
+```
+
+脚本自动安装构建依赖并生成 `build/JiYuControl.exe`。单文件已包含 Python 运行时、Qt、Pillow、Tk、中文字体和 FFmpeg，复制到目标 Windows x64 机器即可运行，不需要安装 Python、pip 或独立解码器。已安装全部依赖时可用 `python build.py --skip-deps` 加速后续构建。
+
+构建目录与中间文件不进入 Git。单文件首次启动会解压到系统临时目录，因此启动速度略慢于源码运行。
+
 原 CLI：
 
 ```bash
@@ -98,6 +108,7 @@ python teacher_gui.py
 teacher_gui.py    Qt 桌面界面
 teacher_sim.py    协议实现、网络收发、观看与远控、CLI
 gui_events.py     后端到 GUI 的轻量事件桥接
+build.py          一键构建独立 EXE
 requirements.txt  Python 依赖
 temp/             本地分析材料，不进入 Git
 ```

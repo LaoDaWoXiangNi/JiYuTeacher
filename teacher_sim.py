@@ -963,7 +963,10 @@ class RemoteViewSession:
             if width <= 0 or height <= 0:
                 raise ValueError(f'无效画面尺寸 {width}x{height}')
             import imageio_ffmpeg
-            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+            if getattr(sys, 'frozen', False):
+                ffmpeg = os.path.join(sys._MEIPASS, 'ffmpeg.exe')
+            else:
+                ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
             try:
                 if interactive:
                     raise ImportError('远控模式使用内嵌窗口')

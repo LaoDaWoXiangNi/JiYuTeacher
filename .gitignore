@@ -4,6 +4,7 @@ __pycache__/
 *.log
 .venv/
 venv/
+.build/
 build/
 dist/
 .idea/
