@@ -11,8 +11,11 @@ from PIL import Image, ImageOps
 import io
 import subprocess
 
-LOG_DIR = os.path.join(os.path.expanduser('~'), 'Desktop')
+APP_DIR = os.path.dirname(sys.executable if getattr(sys, 'frozen', False)
+                           else os.path.abspath(__file__))
+LOG_DIR = APP_DIR
 LOG_PATH = os.path.join(LOG_DIR, 'teacher_sim.log')
+REMOTE_VIEW_DIR = os.path.join(APP_DIR, 'teacher_remote_view')
 
 # 默认文件日志级别：INFO 已足够，DEBUG 太占空间。
 # 运行中可用 debug on/off 切换。
@@ -36,24 +39,11 @@ def set_file_log_level(level):
         fh.setLevel(level)
 
 
-def clear_old_logs():
-    """启动时清理上一次的日志文件，避免累积过大。"""
-    for path in [LOG_PATH] + [f'{LOG_PATH}.{i}' for i in range(1, 4)]:
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-        except OSError as e:
-            # 如果删不掉（比如被其他进程占用），至少不要阻止程序启动
-            print(f'[警告] 删除旧日志 {path} 失败：{e}', file=sys.stderr)
-
-
 def setup_logging():
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)  # 允许 DEBUG 通过，由 handler 决定是否写入
     if logger.handlers:
         logger.handlers.clear()
-
-    clear_old_logs()
 
     fh = logging.handlers.RotatingFileHandler(
         LOG_PATH, maxBytes=10*1024*1024, backupCount=3, encoding='utf-8'

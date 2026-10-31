@@ -9,6 +9,7 @@ import sys
 ROOT = Path(__file__).resolve().parent
 WORK = ROOT / '.build'
 OUTPUT = ROOT / 'build'
+APP_NAME = 'JiYuControl'
 
 
 def run(command):
@@ -17,8 +18,9 @@ def run(command):
 
 
 def build():
-    parser = argparse.ArgumentParser(description='构建免 Python 环境的 JiYu Control 单文件 EXE')
+    parser = argparse.ArgumentParser(description='构建免 Python 环境的 JiYu Control 目录版程序')
     parser.add_argument('--skip-deps', action='store_true', help='跳过依赖安装')
+    parser.add_argument('--onefile', action='store_true', help='兼容旧流程；不推荐，启动时需要解压')
     args = parser.parse_args()
     if os.name != 'nt':
         raise SystemExit('独立 Windows EXE 需要在 Windows 上构建。')
@@ -26,7 +28,6 @@ def build():
         run([sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt', 'pyinstaller>=6.0,<7'])
 
     import imageio_ffmpeg
-    import PyInstaller
 
     ffmpeg = Path(imageio_ffmpeg.get_ffmpeg_exe())
     font_candidates = (
@@ -51,11 +52,12 @@ def build():
     shutil.copy2(ffmpeg, bundled_ffmpeg)
     shutil.copy2(font, bundled_font)
 
+    mode = '--onefile' if args.onefile else '--onedir'
     separator = ';' if os.name == 'nt' else ':'
-    command = [
+    run([
         sys.executable, '-m', 'PyInstaller',
-        '--noconfirm', '--clean', '--onefile', '--windowed',
-        '--name', 'JiYuControl',
+        '--noconfirm', '--clean', mode, '--windowed',
+        '--name', APP_NAME,
         '--distpath', OUTPUT,
         '--workpath', WORK / 'work',
         '--specpath', WORK,
@@ -66,9 +68,8 @@ def build():
         '--exclude-module', 'cv2',
         '--exclude-module', 'numpy',
         'teacher_gui.py',
-    ]
-    run(command)
-    spec = WORK / 'JiYuControl.spec'
+    ])
+    spec = WORK / f'{APP_NAME}.spec'
     spec_text = spec.read_text(encoding='utf-8')
     spec_text = spec_text.replace(
         'pyz = PYZ(a.pure)',
@@ -79,12 +80,20 @@ def build():
     spec.write_text(spec_text, encoding='utf-8')
     run([sys.executable, '-m', 'PyInstaller', '--noconfirm',
          '--distpath', OUTPUT, '--workpath', WORK / 'final', spec])
-    executable = OUTPUT / 'JiYuControl.exe'
+
+    executable = (OUTPUT / f'{APP_NAME}.exe' if args.onefile
+                  else OUTPUT / APP_NAME / f'{APP_NAME}.exe')
     if not executable.is_file():
         raise SystemExit('构建结束但没有找到 EXE。')
+    archive = None
+    if not args.onefile:
+        archive = shutil.make_archive(str(OUTPUT / APP_NAME), 'zip', OUTPUT, APP_NAME)
     print(f'\n构建完成：{executable}')
-    print(f'文件大小：{executable.stat().st_size / 1024 / 1024:.1f} MiB')
-    print('目标机器无需 Python、pip 或独立 FFmpeg。')
+    if archive:
+        print(f'便携压缩包：{archive}')
+        print('运行方式：解压整个目录后启动 JiYuControl.exe，无需 Python、pip 或独立 FFmpeg。')
+    else:
+        print('目标机器无需 Python、pip 或独立 FFmpeg；单文件启动时需要解压。')
 
 
 if __name__ == '__main__':

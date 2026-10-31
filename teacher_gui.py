@@ -747,11 +747,23 @@ class MainWindow(QMainWindow):
         self.run_action(callback, self.current_ip)
 
     def run_action(self, callback, *args):
+        operation = getattr(callback, '__name__', str(callback))
+        core.logger.info('[UI] 操作发起 action=%s target=%s args=%s',
+                         operation, self.current_ip, repr(args))
         try:
-            callback(*args)
+            result = callback(*args)
+            if result is False:
+                core.logger.warning('[UI] 操作被拒绝或未完成 action=%s target=%s',
+                                    operation, self.current_ip)
+            else:
+                core.logger.info('[UI] 操作已提交 action=%s target=%s result=%s',
+                                 operation, self.current_ip, repr(result))
+            return result
         except Exception as error:
-            core.logger.exception('GUI 操作失败')
+            core.logger.exception('[UI] 操作失败 action=%s target=%s error=%s',
+                                  operation, self.current_ip, error)
             QMessageBox.critical(self, '操作失败', str(error))
+            return False
 
     def card_action(self, action, ip):
         self.select_student(ip)
@@ -880,6 +892,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(800, lambda: self.run_action(core.request_info, self.current_ip, 1))
 
     def power_dialog(self, ip):
+        core.logger.info('[UI] 打开电源操作确认 target=%s', ip)
         dialog = QDialog(self)
         dialog.setWindowTitle('电源操作')
         layout = QVBoxLayout(dialog)

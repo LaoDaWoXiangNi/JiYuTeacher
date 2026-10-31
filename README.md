@@ -49,9 +49,18 @@ python teacher_gui.py
 python build.py
 ```
 
-脚本自动安装构建依赖并生成 `build/JiYuControl.exe`。单文件已包含 Python 运行时、Qt、Pillow、Tk、中文字体和 FFmpeg，复制到目标 Windows x64 机器即可运行，不需要安装 Python、pip 或独立解码器。已安装全部依赖时可用 `python build.py --skip-deps` 加速后续构建。
+脚本自动安装构建依赖，默认生成目录版：
 
-构建目录与中间文件不进入 Git。单文件首次启动会解压到系统临时目录，因此启动速度略慢于源码运行。
+```text
+build/JiYuControl/JiYuControl.exe
+build/JiYuControl.zip
+```
+
+目录已包含 Python 运行时、Qt、Pillow、Tk、中文字体和 FFmpeg。将 ZIP 解压到目标 Windows x64 机器后，运行目录内的 EXE 即可，不需要安装 Python、pip 或独立解码器。请保留整个程序目录，不要只复制 EXE。
+
+目录版不需要在每次启动时解压，启动性能优于单文件。已安装全部依赖时可用 `python build.py --skip-deps` 加速后续构建；`python build.py --onefile` 仍提供兼容的单文件构建。
+
+构建目录与中间文件不进入 Git。
 
 原 CLI：
 
@@ -92,7 +101,7 @@ python teacher_gui.py
 | `TEACHER_CONTROL_MODE` | 远控模式，默认 2；0 为 Share |
 | `TEACHER_SAVE_PREVIEWS` | 设为 1 时将最新修复预览保存到桌面 |
 
-运行日志写入桌面 `teacher_sim.log`，连续观看输出位于桌面 `teacher_remote_view`。
+运行日志写入程序所在目录的 `teacher_sim.log`，包含网络协议事件及 `[UI]` 操作记录。日志采用 UTF-8，单份最大 10 MiB，自动保留三份轮转备份，启动时不会清空历史记录。连续观看输出位于同级 `teacher_remote_view` 目录。
 
 ## 使用注意
 
