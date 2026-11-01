@@ -2537,6 +2537,36 @@ def session_recv():
     logger.info('[SessionRecv] 退出')
 
 
+def build_rrms(request, accept):
+    """构造 QRMS 对应的 52 字节 RRMS 审批包。"""
+    if not isinstance(request, dict):
+        raise ValueError('RRMS 需要 QRMS 请求字典')
+    try:
+        transaction_guid = bytes.fromhex(request['transaction_guid'])
+        student_id = request['fields'][0]
+        total_size = request['total_size']
+        file_count = request['file_count']
+    except (KeyError, IndexError, TypeError, ValueError) as error:
+        raise ValueError('QRMS 请求缺少 RRMS 所需字段') from error
+    if len(transaction_guid) != 16:
+        raise ValueError('QRMS 事务 GUID 必须是 16 字节')
+    values = (student_id, 1 if accept else 0, 1, total_size, file_count)
+    limits = (0xFFFFFFFF, 1, 1, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFF)
+    if any(not isinstance(value, int) or isinstance(value, bool)
+           or not 0 <= value <= maximum
+           for value, maximum in zip(values, limits)):
+        raise ValueError('RRMS 字段超出协议范围')
+    quota_low = total_size & 0xFFFFFFFF
+    quota_high = total_size >> 32
+    packet = (struct.pack('<III', 0x534D5252, 0x10000, 0x18)
+              + transaction_guid
+              + struct.pack('<6I', student_id, 1 if accept else 0, 1,
+                            quota_low, quota_high, file_count))
+    if len(packet) != 52:
+        raise AssertionError('RRMS 长度错误')
+    return packet
+
+
 def handle_submit_request(d, sip):
     """解析 QRMS 文件提交请求（LibBaseTrans 0x100031B0）。"""
     if len(d) != 0x284 or sip not in students:
@@ -2553,11 +2583,39 @@ def handle_submit_request(d, sip):
         'file_count': fields[7],
         'total_size': total_size,
         'fields': fields,
+        'student_id': fields[0],
+        'status': 'pending',
     }
+    previous = students[sip].get('submit_request')
     students[sip]['submit_request'] = request
-    logger.info('[FileSubmit] %s guid=%s files=%d bytes=%d directory=%s list=%s fields=%s',
-                sip, transaction_guid, fields[7], total_size, directory, file_list, fields)
+    logger.info('[FileSubmit] %s guid=%s files=%d bytes=%d directory=%s list=%s fields=%s '
+                'status=pending replaces=%s',
+                sip, transaction_guid, fields[7], total_size, directory, file_list, fields,
+                previous['transaction_guid'] if previous else 'none')
     return True
+
+
+def respond_submit_request(sip, accept):
+    """仅对待审批 QRMS 发送 RRMS；发送成功后才更新审批状态。"""
+    request = students.get(sip, {}).get('submit_request')
+    if request is None:
+        raise ValueError(f'{sip} 没有文件提交请求')
+    if request.get('status') != 'pending':
+        raise ValueError(f'{sip} 的文件提交请求已审批，不能重复操作')
+    packet = build_rrms(request, accept)
+    try:
+        sock.sendto(packet, (sip, PORT))
+    except Exception:
+        logger.exception('[FileSubmit] RRMS 发送失败 sip=%s guid=%s accept=%s；保留 pending',
+                         sip, request['transaction_guid'], bool(accept))
+        raise
+    request['status'] = 'approved' if accept else 'rejected'
+    logger.info('[FileSubmit] RRMS -> %s:%d guid=%s status=%s student_id=%d '
+                'accept=%d arg2=1 arg3=1 quota=%d max_files=%d；仅审批，未传输文件',
+                sip, PORT, request['transaction_guid'], request['status'],
+                request['student_id'], 1 if accept else 0,
+                request['total_size'], request['file_count'])
+    return request
 
 
 def main_recv():

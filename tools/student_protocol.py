@@ -18,6 +18,7 @@ MAGIC_LOGI = 0x49474F4C
 MAGIC_ANNO = 0x4F4E4E41
 MAGIC_MESS = 0x5353454D
 MAGIC_QRMS = 0x534D5251
+MAGIC_RRMS = 0x534D5252
 MAGIC_LPNT = 0x544E504C
 MAGIC_DMOC = 0x434F4D44
 
@@ -244,14 +245,17 @@ def build_info_reply(teacher_ip: str, rtype: int, facts: dict,
 def build_submit_request(teacher_ip: str, directory: str,
                          file_list: str, file_count: int = 1,
                          total_size: int = 0,
-                         transaction_guid: uuid.UUID | None = None) -> bytes:
+                         transaction_guid: uuid.UUID | None = None,
+                         student_id: int = 0) -> bytes:
     socket.inet_aton(teacher_ip)
     if not 0 <= file_count <= 0xFFFFFFFF:
         raise ValueError('文件数超出范围')
     if not 0 <= total_size <= 0xFFFFFFFFFFFFFFFF:
         raise ValueError('文件总大小超出范围')
+    if not 0 <= student_id <= 0xFFFFFFFF:
+        raise ValueError('学生 ID 超出 u32 范围')
     transaction_guid = transaction_guid or uuid.uuid4()
-    fields = (0, 1, 0, 0, 0,
+    fields = (student_id, 1, 0, 0, 0,
               total_size & 0xFFFFFFFF, total_size >> 32, file_count)
     body = bytearray(0x284 - 28)
     struct.pack_into('<8I', body, 0, *fields)
@@ -260,12 +264,53 @@ def build_submit_request(teacher_ip: str, directory: str,
     return packet(MAGIC_QRMS, 0x10000, bytes(body), transaction_guid.bytes_le)
 
 
+def build_submit_response(student_id: int, accept: int, arg2: int,
+                          quota: int = 1, max_files: int = 0,
+                          transaction_guid: uuid.UUID | None = None) -> bytes:
+    values = (student_id, accept, arg2, quota & 0xFFFFFFFF,
+              (quota >> 32) & 0xFFFFFFFF, max_files)
+    if any(not 0 <= value <= 0xFFFFFFFF for value in values):
+        raise ValueError('RRMS 字段超出 u32 范围')
+    if not 0 <= quota <= 0xFFFFFFFFFFFFFFFF:
+        raise ValueError('RRMS 配额超出 u64 范围')
+    transaction_guid = transaction_guid or uuid.uuid4()
+    body = struct.pack('<6I', *values)
+    result = packet(MAGIC_RRMS, 0x10000, body, transaction_guid.bytes_le)
+    if len(result) != 52:
+        raise AssertionError('RRMS 长度错误')
+    return result
+
+
+def parse_submit_response(data: bytes) -> dict:
+    if len(data) != 52:
+        raise ValueError(f'RRMS 总长必须为 52 字节，实际 {len(data)}')
+    magic, version, declared = struct.unpack_from('<III', data)
+    if magic != MAGIC_RRMS:
+        raise ValueError(f'RRMS 魔数错误：0x{magic:08X}')
+    if version != 0x10000:
+        raise ValueError(f'RRMS 版本错误：0x{version:08X}')
+    if declared != 0x18:
+        raise ValueError(f'RRMS 声明负载长度必须为 0x18，实际 0x{declared:X}')
+    fields = struct.unpack_from('<6I', data, 28)
+    return {
+        'transaction_guid': data[12:28].hex(),
+        'student_id': fields[0],
+        'accept': fields[1],
+        'arg2': fields[2],
+        'arg3': fields[3],
+        'quota': fields[3] | fields[4] << 32,
+        'max_files': fields[5],
+        'fields': fields,
+    }
+
+
 def parse_submit_request(data: bytes) -> dict:
     if len(data) != 0x284 or struct.unpack_from('<I', data)[0] != MAGIC_QRMS:
         raise ValueError('QRMS 包长度或魔数错误')
     fields = struct.unpack_from('<8I', data, 28)
     return {
         'transaction_guid': data[12:28].hex(),
+        'student_id': fields[0],
         'directory': decode_wstr(data[60:124]),
         'file_list': decode_wstr(data[124:644]),
         'file_count': fields[7],

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import struct
+import tempfile
 import traceback
 import uuid
+from pathlib import Path
 from unittest import mock
 
 try:
@@ -105,13 +107,113 @@ def run_self_test() -> int:
     def submission():
         guid = uuid.UUID('00112233-4455-6677-8899-aabbccddeeff')
         data = protocol.build_submit_request('192.0.2.10', r'C:\work', 'a.txt|b.txt',
-                                             2, 0x100000005, guid)
+                                             2, 0x100000005, guid, 42)
         assert len(data) == 0x284
         parsed = protocol.parse_submit_request(data)
         assert parsed['directory'] == r'C:\work'
         assert parsed['file_list'] == 'a.txt|b.txt'
         assert parsed['file_count'] == 2 and parsed['total_size'] == 0x100000005
         assert parsed['transaction_guid'] == guid.bytes_le.hex()
+        assert parsed['student_id'] == 42
+
+        response = protocol.build_submit_response(42, 1, 1, 0x100000005, 2, guid)
+        assert len(response) == 52
+        assert response[:4] == b'RRMS'
+        assert struct.unpack_from('<III', response) == (protocol.MAGIC_RRMS, 0x10000, 0x18)
+        assert response[12:28] == guid.bytes_le
+        parsed_response = protocol.parse_submit_response(response)
+        assert parsed_response['transaction_guid'] == guid.bytes_le.hex()
+        assert parsed_response['student_id'] == 42
+        assert parsed_response['fields'][1:4] == (1, 1, 5)
+        assert parsed_response['quota'] == 0x100000005
+        assert parsed_response['max_files'] == 2
+        for invalid in (response[:-1], response + b'\x00'):
+            try:
+                protocol.parse_submit_response(invalid)
+            except ValueError as exc:
+                assert '52' in str(exc)
+            else:
+                raise AssertionError('RRMS 非法总长未被拒绝')
+        for offset, value in ((0, protocol.MAGIC_QRMS), (4, 1), (8, 0x17)):
+            invalid = bytearray(response)
+            struct.pack_into('<I', invalid, offset, value)
+            try:
+                protocol.parse_submit_response(bytes(invalid))
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'RRMS 非法头字段未被拒绝：offset={offset}')
+
+    def submission_state():
+        machine, sent, events = make_machine()
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / 'first.txt'
+            second = Path(directory) / 'second.txt'
+            first.write_bytes(b'first')
+            second.write_bytes(b'second!')
+            machine.submit_files([str(first)])
+            pending = machine.state.pending_submission
+            assert pending is not None
+            assert pending.student_id == 42 and pending.file_count == 1 and pending.total_size == 5
+            assert machine.state.submission_status == 'pending'
+            assert sent[-1][0:3:2] == ('QRMS', 'main')
+            request_guid = uuid.UUID(bytes_le=bytes.fromhex(pending.transaction_guid))
+            approved = protocol.build_submit_response(42, 1, 1, 1,
+                                                      transaction_guid=request_guid)
+            machine.handle_packet(approved, 'main', '192.0.2.99')
+            assert machine.state.submission_status == 'pending'
+            machine.handle_packet(approved, 'main', machine.config.teacher_ip)
+            assert machine.state.submission_status == 'approved'
+            assert machine.state.pending_submission is None
+            assert machine.state.submission_detail == '教师已接受，MiniMedia 上传未实现；不会发送文件内容'
+            assert len(sent) == 1
+            machine.handle_packet(approved, 'main', machine.config.teacher_ip)
+            assert len(sent) == 1
+            assert any('重复 RRMS' in text for _, text in events)
+
+            machine.submit_files([str(second)])
+            pending = machine.state.pending_submission
+            assert pending is not None and pending.total_size == 7
+            current_guid = uuid.UUID(bytes_le=bytes.fromhex(pending.transaction_guid))
+            assert current_guid != request_guid
+            mismatch = protocol.build_submit_response(42, 1, 1, 1,
+                                                      transaction_guid=request_guid)
+            machine.handle_packet(mismatch, 'main', machine.config.teacher_ip)
+            assert machine.state.submission_status == 'pending'
+            assert any('GUID 不匹配' in text for _, text in events)
+            wrong_id = protocol.build_submit_response(43, 1, 1, 1,
+                                                      transaction_guid=current_guid)
+            machine.handle_packet(wrong_id, 'main', machine.config.teacher_ip)
+            assert machine.state.submission_status == 'pending'
+            assert any('学生 ID 不匹配' in text for _, text in events)
+            machine.handle_packet(approved[:-1], 'main', machine.config.teacher_ip)
+            assert machine.state.submission_status == 'pending'
+            assert any('格式无效' in text for _, text in events)
+
+            rejected = protocol.build_submit_response(42, 1, 0, 1024, 3, current_guid)
+            machine.handle_packet(rejected, 'main', machine.config.teacher_ip)
+            assert machine.state.submission_status == 'rejected'
+            assert 'arg2=0' in machine.state.submission_detail
+            assert '配额=1024' in machine.state.submission_detail
+            assert machine.state.pending_submission is None
+
+            machine.submit_files([str(first)])
+            current_guid = uuid.UUID(bytes_le=bytes.fromhex(
+                machine.state.pending_submission.transaction_guid))
+            for accept, arg2, arg3 in ((0, 1, 0), (1, 1, 0)):
+                response = protocol.build_submit_response(42, accept, arg2, arg3,
+                                                          transaction_guid=current_guid)
+                machine.handle_packet(response, 'main', machine.config.teacher_ip)
+                assert machine.state.submission_status == 'rejected'
+                assert machine.state.pending_submission is None
+                assert all(kind != 'RRMS' for kind, _, _ in sent)
+                if accept:
+                    break
+                machine.submit_files([str(first)])
+                current_guid = uuid.UUID(bytes_le=bytes.fromhex(
+                    machine.state.pending_submission.transaction_guid))
+        status = '\n'.join(machine.state.status_lines(machine.config, False))
+        assert '文件提交：rejected' in status and '待回复请求：无' in status
 
     def login_and_info():
         machine, sent, events = make_machine()
@@ -233,7 +335,9 @@ def run_self_test() -> int:
 
     for name, function in (
         ('报文构造与聊天/ANNO', packets), ('系统信息与列表分片', information),
-        ('QRMS 文件提交请求', submission), ('登录与信息请求状态', login_and_info),
+        ('QRMS/RRMS 构造与严格解析', submission),
+        ('文件提交状态/拒绝/校验/重复', submission_state),
+        ('登录与信息请求状态', login_and_info),
         ('黑屏与解除状态', blackscreen), ('媒体/远控/LPNT 可见事件', media_and_control),
         ('危险动作即使 execute 也不执行', dangerous_actions), ('默认观察模式', observation_defaults),
         ('拒绝同机同 IP 配置', same_ip_rejected), ('无网络关闭与失败回滚', close_without_network),

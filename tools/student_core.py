@@ -57,6 +57,14 @@ class StudentConfig:
         return self.session_port or protocol.session_endpoint(self.channel)[1]
 
 
+@dataclass(frozen=True)
+class PendingSubmission:
+    transaction_guid: str
+    student_id: int
+    file_count: int
+    total_size: int
+
+
 @dataclass
 class StudentState:
     online: bool = False
@@ -70,9 +78,15 @@ class StudentState:
     screen_broadcast: bool = False
     remote_view: bool = False
     remote_control: bool = False
+    pending_submission: PendingSubmission | None = None
+    submission_status: str = 'idle'
+    submission_detail: str = '尚未发送文件提交请求'
     last_teacher_packet: float = 0.0
 
     def status_lines(self, config: StudentConfig, execute: bool) -> list[str]:
+        pending = self.pending_submission
+        pending_text = (f'{pending.file_count} 个文件，{pending.total_size} 字节，'
+                        f'GUID {pending.transaction_guid}') if pending else '无'
         return [
             f"状态：{'在线' if self.online else '离线/等待登录'}",
             f'教师：{config.teacher_ip}（主 {config.main_port}，会话 {config.session_port_or_default}）',
@@ -80,6 +94,8 @@ class StudentState:
             f'黑屏：{"是（仅提示）" if self.blackscreen else "否"}；举手：{"是" if self.hand_up else "否"}',
             f'广播：{"是" if self.screen_broadcast else "否"}；观看：{"是" if self.remote_view else "否"}；'
             f'远控请求：{"是（不执行）" if self.remote_control else "否"}',
+            f'文件提交：{self.submission_status}；{self.submission_detail}',
+            f'待回复请求：{pending_text}',
             f'动作模式：{"受限白名单" if execute else "观察（全部仅记录）"}',
         ]
 
@@ -101,6 +117,7 @@ class StudentMachine:
         self.windows = list(windows) or [(0x10010, '模拟学生端'), (0x10020, '课堂窗口')]
         self.processes = list(processes) or [(os.getpid(), Path(os.sys.executable).name)]
         self._reply_log = []
+        self._last_submission_guid = ''
 
     def event(self, kind: str, text: str) -> None:
         LOGGER.info('[%s] %s', kind, text)
@@ -138,10 +155,60 @@ class StudentMachine:
         total_size = sum(path.stat().st_size for path in files)
         directory = str(files[0].resolve().parent)
         file_list = '|'.join(path.name for path in files)
+        student_id = self.facts.get('stu_id', 1)
         data = protocol.build_submit_request(
-            self.config.teacher_ip, directory, file_list, len(files), total_size)
+            self.config.teacher_ip, directory, file_list, len(files), total_size,
+            student_id=student_id)
+        pending = PendingSubmission(data[12:28].hex(), student_id, len(files), total_size)
         self.send('QRMS', data, 'main')
-        self.event('文件提交', f'已发送 QRMS 请求：{len(files)} 个文件，{total_size} 字节；{file_list}')
+        self.state.pending_submission = pending
+        self.state.submission_status = 'pending'
+        self.state.submission_detail = '等待教师 RRMS 回复；不会发送文件内容'
+        self._last_submission_guid = pending.transaction_guid
+        self.event('文件提交', f'已发送 QRMS 请求：{len(files)} 个文件，{total_size} 字节；'
+                              f'GUID={pending.transaction_guid}；{file_list}')
+
+    def handle_rrms(self, data: bytes, source_ip: str = '') -> None:
+        if source_ip != self.config.teacher_ip:
+            self.event('忽略', f'RRMS 来源不是教师：{source_ip or "未知"}')
+            return
+        try:
+            response = protocol.parse_submit_response(data)
+        except ValueError as exc:
+            self.event('忽略', f'RRMS 格式无效：{exc}')
+            return
+        guid = response['transaction_guid']
+        pending = self.state.pending_submission
+        if pending is None and guid == self._last_submission_guid:
+            self.event('文件提交', f'收到重复 RRMS，保持 {self.state.submission_status}；不重复处理')
+            return
+        if pending is None:
+            self.event('忽略', f'RRMS 没有匹配的待处理请求：GUID={guid}')
+            return
+        if guid != pending.transaction_guid:
+            self.event('忽略', f'RRMS GUID 不匹配：收到 {guid}，'
+                              f'等待 {pending.transaction_guid}')
+            return
+        if response['student_id'] != pending.student_id:
+            self.event('忽略', f"RRMS 学生 ID 不匹配：收到 {response['student_id']}，"
+                              f'等待 {pending.student_id}')
+            return
+        self.state.pending_submission = None
+        approved = bool(response['accept'] and response['arg2'] and response['arg3'])
+        if approved:
+            self.state.submission_status = 'approved'
+            self.state.submission_detail = '教师已接受，MiniMedia 上传未实现；不会发送文件内容'
+        else:
+            self.state.submission_status = 'rejected'
+            if response['accept'] and not response['arg2']:
+                self.state.submission_detail = (
+                    f"教师按配额/文件数限制拒绝：arg2=0，配额={response['quota']} 字节，"
+                    f"最大文件数={response['max_files']}；不会发送文件内容")
+            else:
+                self.state.submission_detail = (
+                    f"教师拒绝提交：accept={response['accept']}，arg2={response['arg2']}，"
+                    f"arg3={response['arg3']}；不会发送文件内容")
+        self.event('文件提交', self.state.submission_detail)
 
     def answer_info(self, rtype: int) -> int:
         packets = protocol.build_info_reply(
@@ -312,6 +379,8 @@ class StudentMachine:
             self.state.last_teacher_packet = time.monotonic()
         if magic == protocol.MAGIC_MESS:
             self.handle_mess(data, source_ip)
+        elif magic == protocol.MAGIC_RRMS:
+            self.handle_rrms(data, source_ip)
         elif magic == protocol.MAGIC_LPNT:
             policy = protocol.parse_lpnt(data)
             self.state.preview_enabled = policy['enabled']

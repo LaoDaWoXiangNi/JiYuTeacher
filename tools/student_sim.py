@@ -104,7 +104,7 @@ def make_config(args):
 CLI_HELP = '''命令：
   chat <文本>             发送 MESS type=0x800 聊天
   handup / handdown       举手 / 取消举手（ANNO 72 字节）
-  submit <文件> [...]     发送 QRMS 提交请求，不上传文件内容；路径含空格请加引号
+  submit <文件> [...]     发送 QRMS 并等待 RRMS；不上传内容；路径含空格请加引号
   info [0|1|2]           主动上报全部/窗口/进程信息
   status                 显示当前模拟状态
   login                  立即发送 LOGI（后台也会周期保活）

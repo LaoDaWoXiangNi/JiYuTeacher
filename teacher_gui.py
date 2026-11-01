@@ -261,7 +261,7 @@ class StudentCard(QFrame):
         self.name.setToolTip(name)
         self.address.setText(f'{self.ip}  /  {user}' if user else self.ip)
         hand_up = student.get('anno_state', {}).get('hand_up', False)
-        has_submit = 'submit_request' in student
+        has_submit = student.get('submit_request', {}).get('status') == 'pending'
         self.live.setText('▲  FILE SUBMIT' if has_submit else
                           ('▲  HAND UP' if hand_up else '●  ONLINE'))
         self.live.setProperty('handUp', hand_up or has_submit)
@@ -561,9 +561,28 @@ class MainWindow(QMainWindow):
         self.selected_label.setObjectName('sectionTitle')
         box.addWidget(self.selected_label)
         self.device_tabs = QTabWidget()
+        device_page = QWidget()
+        device_layout = QVBoxLayout(device_page)
+        device_layout.setContentsMargins(0, 0, 0, 0)
+        device_layout.setSpacing(0)
         self.info_text = QPlainTextEdit()
         self.info_text.setReadOnly(True)
-        self.device_tabs.addTab(self.info_text, '设备')
+        device_layout.addWidget(self.info_text, 1)
+        self.submit_controls = QWidget()
+        submit_layout = QHBoxLayout(self.submit_controls)
+        submit_layout.setContentsMargins(8, 8, 8, 8)
+        submit_layout.setSpacing(8)
+        self.accept_submit_button = QPushButton('接受文件提交')
+        self.accept_submit_button.clicked.connect(
+            lambda: self.review_submit_request(True))
+        self.reject_submit_button = QPushButton('拒绝文件提交')
+        self.reject_submit_button.clicked.connect(
+            lambda: self.review_submit_request(False))
+        submit_layout.addWidget(self.accept_submit_button)
+        submit_layout.addWidget(self.reject_submit_button)
+        device_layout.addWidget(self.submit_controls)
+        self.submit_controls.hide()
+        self.device_tabs.addTab(device_page, '设备')
         self.process_table = self.id_name_table(('PID', '进程名称'))
         self.device_tabs.addTab(self.process_table, '进程')
         self.window_table = self.id_name_table(('句柄', '窗口标题'))
@@ -825,16 +844,62 @@ class MainWindow(QMainWindow):
                   f'学生状态：0x{anno.get("student_flags", 0):08X}\n'
                   f'黑屏状态：0x{anno.get("blackscreen_flags", 0):08X}')
         submit = student.get('submit_request')
+        submit_status = submit.get('status') if submit else None
         if submit:
+            state_text = {
+                'pending': '待审批（可接受或拒绝）',
+                'approved': '已接受（仅 RRMS 审批完成，MiniMedia 未实现，未上传文件）',
+                'rejected': '已拒绝（仅 RRMS 审批完成，未上传文件）',
+            }.get(submit_status, submit_status)
             status += (f'\n文件提交：{submit["file_count"]} 个文件，{submit["total_size"]} 字节\n'
                        f'目录：{submit["directory"]}\n'
                        f'列表：{submit["file_list"]}\n'
-                       f'事务：{submit["transaction_guid"]}（仅监测，未接受）')
+                       f'事务：{submit["transaction_guid"]}\n'
+                       f'审批状态：{state_text}')
         self.info_text.setPlainText(('\n'.join(
             f'{label}：{self.current_ip if key is None else info.get(key, "待上报")}'
             for label, key in labels) + '\n' + status) if self.current_ip else '请先从左侧选择终端。')
+        self.submit_controls.setVisible(bool(submit))
+        pending = submit_status == 'pending'
+        self.accept_submit_button.setEnabled(pending)
+        self.reject_submit_button.setEnabled(pending)
         self.fill_id_name_table(self.process_table, student.get('processes', []), False)
         self.fill_id_name_table(self.window_table, student.get('windows', []), True)
+        if self.current_ip in self.cards:
+            self.cards[self.current_ip].update_student(student)
+
+    def review_submit_request(self, accept):
+        ip = self.current_ip
+        request = core.students.get(ip, {}).get('submit_request')
+        if request is None:
+            core.logger.warning('[UI] 文件提交审批取消 target=%s reason=没有请求', ip)
+            QMessageBox.information(self, '无法审批', '所选终端没有文件提交请求。')
+            return
+        if request.get('status') != 'pending':
+            core.logger.warning('[UI] 文件提交审批取消 target=%s guid=%s reason=重复审批',
+                                ip, request['transaction_guid'])
+            self.update_selected_details()
+            return
+        action = '接受' if accept else '拒绝'
+        detail = ('仅发送 RRMS 接受审批，不会上传或接收文件；MiniMedia 尚未实现。'
+                  if accept else '仅发送 RRMS 拒绝审批，不会上传或接收文件。')
+        core.logger.info('[UI] 文件提交审批确认 target=%s guid=%s action=%s',
+                         ip, request['transaction_guid'], action)
+        if not self.confirm(f'{action}文件提交',
+                            f'终端：{ip}\n文件数：{request["file_count"]}\n\n{detail}'):
+            core.logger.info('[UI] 文件提交审批已取消 target=%s action=%s', ip, action)
+            return
+        result = self.run_action(core.respond_submit_request, ip, accept)
+        self.update_selected_details()
+        if result is False:
+            return
+        message = (f'已向 {ip} 发送 RRMS {action}审批。当前状态：{result["status"]}。\n\n'
+                   '这只是审批结果，不是文件上传或传输完成。')
+        if accept:
+            message += '\nMiniMedia 尚未实现，本次没有传输任何文件。'
+        core.logger.info('[UI] 文件提交审批完成 target=%s guid=%s status=%s',
+                         ip, result['transaction_guid'], result['status'])
+        QMessageBox.information(self, 'RRMS 审批已发送', message)
 
     def fill_id_name_table(self, table, rows, hexadecimal):
         table.setRowCount(len(rows))
