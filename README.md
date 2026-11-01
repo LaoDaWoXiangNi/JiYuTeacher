@@ -113,6 +113,7 @@ python teacher_gui.py
 | `TEACHER_TCP_PORT` | 连续观看端口，默认 4806 |
 | `TEACHER_CONTROL_MODE` | 远控模式，默认 2；0 为 Share |
 | `TEACHER_SAVE_PREVIEWS` | 设为 1 时将最新修复预览保存到桌面 |
+| `TEACHER_DEMO_VOICE_PORT` | 实验性 feature 4 语音监听端口；GUI 中也可输入，不代表已建立媒体连接 |
 
 运行日志写入程序所在目录的 `teacher_sim.log`，包含网络协议事件及 `[UI]` 操作记录。日志采用 UTF-8，单份最大 10 MiB，自动保留三份轮转备份，启动时不会清空历史记录。连续观看输出位于同级 `teacher_remote_view` 目录。
 
