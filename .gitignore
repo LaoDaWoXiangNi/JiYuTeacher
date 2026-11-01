@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *.log
 classroom_config.json
+classrooms.json
 .venv/
 venv/
 .build/
