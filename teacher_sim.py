@@ -136,6 +136,7 @@ completed_preview_frames = {}  # sip -> 最近完整接收的帧序号
 preview_policy_versions = {}   # sip -> 最近发送的 LPNT policy version
 remote_views = {}  # sip -> RemoteViewSession
 remote_controls = {}  # sip -> {'port': int, 'sock': socket.socket}
+screen_broadcasts = {}  # sip -> 广播启动参数；媒体推流会话单独管理
 remote_view_failures = {}  # sip -> 最近失败时间；避免反复触发学生端编码器
 remote_state_lock = threading.RLock()
 last_status = {}  # (sip, key) -> 最近一条同类消息内容（重复降为 DEBUG，防止刷屏）
@@ -627,6 +628,36 @@ def send_remote_view_feature(sip, enabled=True):
     logger.info('[RemoteView] feature %s -> %s:%d, payload=%d, mess=%d',
                 'start' if enabled else 'stop', sip, SPORT,
                 len(payload), len(packet))
+
+
+def build_screen_broadcast_payload(sip):
+    params = bytearray(build_remote_view_payload(sip)[12:-1])
+    params[0:4] = b'\x00' * 4  # 第一版只广播视频，不启用学生音频回传。
+    params[8:10] = b'\x00' * 2
+    payload = struct.pack('<III', 617, 1, 0x80000000) + params + b'\x00'
+    if len(payload) != 617:
+        raise AssertionError('feature 1 广播参数长度错误')
+    return payload
+
+
+def start_screen_broadcast(sip):
+    if not _check_student(sip, 'broadcast <学生IP>'):
+        return False
+    payload = build_screen_broadcast_payload(sip)
+    sock2.sendto(build_mess_packet(sip, payload), (sip, SPORT))
+    screen_broadcasts[sip] = {'started_at': time.time(), 'streaming': False}
+    logger.info('[Broadcast] feature 1 启动包已发送 -> %s；等待媒体推流实现', sip)
+    return True
+
+
+def stop_screen_broadcast(sip):
+    if not _check_student(sip, 'broadcast_stop <学生IP>'):
+        return False
+    sock2.sendto(build_mess_packet(sip, struct.pack('<III', 13, 1, 0) + b'\x00'),
+                 (sip, SPORT))
+    screen_broadcasts.pop(sip, None)
+    logger.info('[Broadcast] feature 1 停止包已发送 -> %s', sip)
+    return True
 
 
 class RemoteViewSession:
@@ -3169,6 +3200,11 @@ def shutdown():
         stop_remote_view(sip, notify=False)
     for sip in list(remote_controls):
         stop_remote_control(sip, notify=False)
+    for sip in list(screen_broadcasts):
+        try:
+            stop_screen_broadcast(sip)
+        except OSError as error:
+            logger.warning('[Broadcast] 退出时停止 %s 失败：%s', sip, error)
     for network_socket in (sock, sock2):
         try:
             network_socket.close()

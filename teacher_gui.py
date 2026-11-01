@@ -519,6 +519,7 @@ class MainWindow(QMainWindow):
             ('刷新信息', 'refresh', lambda: self.selected(core.request_info)),
             ('请求预览', 'monitor', lambda: self.selected(core.request_preview)),
             ('连续观看', 'eye', lambda: self.selected(self.start_view)),
+            ('屏幕广播', 'monitor', self.toggle_broadcast),
             ('远程控制', 'cursor', lambda: self.selected(self.start_control)),
             ('发送消息', 'message', lambda: self.selected(self.chat_dialog)),
             ('黑屏安静', 'lock', lambda: self.selected(self.blackscreen_dialog)),
@@ -784,6 +785,21 @@ class MainWindow(QMainWindow):
                                   operation, self.current_ip, error)
             QMessageBox.critical(self, '操作失败', str(error))
             return False
+
+    def toggle_broadcast(self):
+        if not self.current_ip:
+            QMessageBox.information(self, '尚未选择终端', '请先选择广播目标。')
+            return
+        ip = self.current_ip
+        if ip in core.screen_broadcasts:
+            self.run_action(core.stop_screen_broadcast, ip)
+        else:
+            started = self.run_action(core.start_screen_broadcast, ip)
+            if started:
+                QMessageBox.information(
+                    self, '广播启动包已发送',
+                    '学生端已收到 feature 1 启动参数。\n'
+                    '当前版本尚未推送屏幕媒体流，这不代表学生端已经显示画面。')
 
     def card_action(self, action, ip):
         self.select_student(ip)
