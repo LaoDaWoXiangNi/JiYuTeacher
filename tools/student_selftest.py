@@ -306,6 +306,8 @@ def run_self_test() -> int:
     def close_without_network():
         machine, _, _ = make_machine()
         client = student_core.UdpStudentClient(machine)
+        machine.event('文件提交', '时间线事件')
+        assert list(client.drain_events()) == [('文件提交', '时间线事件')]
         machine.state.online = True
         machine.state.login_replies = {0x1000, 0x8000}
         client.close()

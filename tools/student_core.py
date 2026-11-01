@@ -407,7 +407,7 @@ class UdpStudentClient:
         self._lifecycle_lock = threading.RLock()
         self._heartbeat = 5.0
         machine.sender = self.send
-        machine.event_handler = self.events.put
+        machine.event_handler = lambda kind, text: self.events.put((kind, text))
 
     def _make_socket(self, port: int, multicast_group: str | None = None) -> socket.socket:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
