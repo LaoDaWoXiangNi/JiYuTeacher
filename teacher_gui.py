@@ -363,7 +363,7 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.refresh_students)
         self.timer.start(800)
         self.refresh_students()
-        self.append_log(f'教师端在线 · {core.ip} · 频道 {core.CHANNEL_ID}', logging.INFO)
+        core.logger.info('教师端在线 · %s · 频道 %d', core.ip, core.CHANNEL_ID)
 
     def build_ui(self):
         root = QWidget()

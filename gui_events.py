@@ -23,7 +23,7 @@ chat_events = EventChannel()
 
 class LogBridge(logging.Handler):
     def emit(self, record):
-        if not log_events.callbacks:
+        if record.name.startswith('student_sim') or not log_events.callbacks:
             return
         try:
             log_events.publish(self.format(record), record.levelno)
