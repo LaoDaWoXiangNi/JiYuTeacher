@@ -1,6 +1,7 @@
 import logging
 import os
 import sys
+import time
 from functools import partial
 
 from PyQt6.QtCore import QObject, QRectF, QSize, Qt, QTimer, pyqtSignal
@@ -15,7 +16,13 @@ from PyQt6.QtWidgets import (
     QTabWidget, QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
 
+import app_config
 import gui_events
+
+CHANNEL_FROM_ENV = 'TEACHER_CHANNEL' in os.environ
+if not CHANNEL_FROM_ENV:
+    os.environ['TEACHER_CHANNEL'] = str(app_config.load_channel())
+
 import teacher_sim as core
 
 
@@ -146,6 +153,7 @@ def icon(name, color=CYAN, size=20):
 class UiBridge(QObject):
     preview = pyqtSignal(str, object)
     log = pyqtSignal(str, int)
+    chat = pyqtSignal(str, str)
 
 
 class CardScrollArea(QScrollArea):
@@ -257,7 +265,6 @@ class StudentCard(QFrame):
         self.live.setText('▲  FILE SUBMIT' if has_submit else
                           ('▲  HAND UP' if hand_up else '●  ONLINE'))
         self.live.setProperty('handUp', hand_up or has_submit)
-        self.live.setProperty('handUp', hand_up)
         self.live.style().unpolish(self.live)
         self.live.style().polish(self.live)
 
@@ -297,6 +304,40 @@ class TextCommandDialog(QDialog):
         return {key: editor.text().strip() for key, editor in self.inputs.items()}
 
 
+class ChannelSettingsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('频道设置')
+        self.setMinimumWidth(440)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(26, 24, 26, 24)
+        heading = QLabel('频道设置')
+        heading.setObjectName('dialogTitle')
+        layout.addWidget(heading)
+        form = QFormLayout()
+        self.channel_input = QSpinBox()
+        self.channel_input.setRange(1, 32)
+        self.channel_input.setValue(app_config.load_channel())
+        self.channel_input.setAccessibleName('下次启动使用的频道')
+        form.addRow('频道（1–32）', self.channel_input)
+        layout.addLayout(form)
+        current = QLabel(f'当前运行频道：{core.CHANNEL_ID}（保存后重启生效）')
+        current.setObjectName('muted')
+        current.setWordWrap(True)
+        layout.addWidget(current)
+        if CHANNEL_FROM_ENV:
+            env_note = QLabel('检测到 TEACHER_CHANNEL 环境变量；其值优先于此处保存的配置。')
+            env_note.setObjectName('warning')
+            env_note.setWordWrap(True)
+            layout.addWidget(env_note)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        save = buttons.addButton('保存', QDialogButtonBox.ButtonRole.AcceptRole)
+        save.setObjectName('accentButton')
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -309,8 +350,14 @@ class MainWindow(QMainWindow):
         self.bridge = UiBridge()
         self.bridge.preview.connect(self.set_preview)
         self.bridge.log.connect(self.append_log)
-        gui_events.preview_events.connect(self.bridge.preview.emit)
-        gui_events.log_events.connect(self.bridge.log.emit)
+        self.bridge.chat.connect(self.append_chat)
+        self.event_callbacks = (
+            (gui_events.preview_events, self.bridge.preview.emit),
+            (gui_events.log_events, self.bridge.log.emit),
+            (gui_events.chat_events, self.bridge.chat.emit),
+        )
+        for channel, callback in self.event_callbacks:
+            channel.connect(callback)
         self.build_ui()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_students)
@@ -369,8 +416,17 @@ class MainWindow(QMainWindow):
         channel = QLabel(f'{core.CHANNEL_ID:02d}')
         channel.setObjectName('channelBadge')
         channel.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        channel.setToolTip(f'当前频道 {core.CHANNEL_ID}')
+        channel.setToolTip(f'当前运行频道 {core.CHANNEL_ID}')
         layout.addWidget(channel)
+        settings = QPushButton(icon('settings', '#8290a4', 18), '')
+        settings.setObjectName('channelSettings')
+        settings.setToolTip('频道设置（重启生效）')
+        settings.setAccessibleName('频道设置')
+        settings.setAccessibleDescription('配置下次启动使用的教师端频道，范围 1 到 32')
+        settings.setFixedSize(56, 38)
+        settings.setCursor(Qt.CursorShape.PointingHandCursor)
+        settings.clicked.connect(self.channel_settings)
+        layout.addWidget(settings)
         return side
 
     def create_header(self):
@@ -577,6 +633,12 @@ class MainWindow(QMainWindow):
         self.chat_target = QLabel('选择收件终端')
         self.chat_target.setObjectName('dialogTitle')
         right.addWidget(self.chat_target)
+        self.chat_history = QPlainTextEdit()
+        self.chat_history.setReadOnly(True)
+        self.chat_history.setMaximumBlockCount(3000)
+        self.chat_history.setObjectName('chatHistory')
+        self.chat_history.setPlaceholderText('暂无聊天记录')
+        right.addWidget(self.chat_history, 1)
         self.chat_input = QPlainTextEdit()
         self.chat_input.setPlaceholderText('输入消息内容…\n\n消息将通过 MESS 会话通道发送到所选终端。')
         right.addWidget(self.chat_input, 1)
@@ -628,7 +690,7 @@ class MainWindow(QMainWindow):
         self.view_stat.setObjectName('monoMuted')
         layout.addWidget(self.view_stat)
         layout.addStretch()
-        protocol = QLabel('JIYU V6.0   ·   UDP 4705 / 5512   ·   TCP 4806')
+        protocol = QLabel(f'JIYU V6.0   ·   UDP {core.PORT} / {core.SPORT}   ·   TCP 4806')
         protocol.setObjectName('monoMuted')
         layout.addWidget(protocol)
         return bar
@@ -640,6 +702,26 @@ class MainWindow(QMainWindow):
             button.setIcon(icon(('grid', 'devices', 'message', 'terminal')[i],
                                 CYAN if i == index else '#8290a4', 23))
         self.page_title.setText(('课堂工作台', '终端管理', '消息中心', '事件日志')[index])
+
+    def channel_settings(self):
+        dialog = ChannelSettingsDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        channel = dialog.channel_input.value()
+        path = app_config.config_path()
+        try:
+            app_config.save_channel(channel, path)
+        except OSError as error:
+            core.logger.error('[UI] 保存频道配置失败 path=%s error=%s', path, error)
+            QMessageBox.critical(self, '保存失败', f'无法写入频道配置：\n{error}')
+            return
+        core.logger.info('[UI] 频道设置已保存：下次启动频道=%d，当前运行频道=%d，path=%s',
+                         channel, core.CHANNEL_ID, path)
+        message = (f'已将下次启动频道保存为 {channel}。\n'
+                   f'当前运行频道仍为 {core.CHANNEL_ID}，重启教师端后生效。')
+        if CHANNEL_FROM_ENV:
+            message += '\n\n当前存在 TEACHER_CHANNEL 环境变量，启动时将优先使用该变量。'
+        QMessageBox.information(self, '频道设置已保存', message)
 
     def refresh_students(self):
         current = set(core.students)
@@ -820,6 +902,14 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'log_text'):
             self.log_text.appendPlainText(text)
 
+    def append_chat(self, ip, text, outgoing=False):
+        name = core.students.get(ip, {}).get('info', {}).get('name') or ip
+        direction = '教师' if outgoing else '学生'
+        self.chat_history.appendPlainText(
+            f'[{time.strftime("%H:%M:%S")}] {direction} · {name} ({ip})\n{text}')
+        scrollbar = self.chat_history.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
     def refresh_all_previews(self):
         for ip in list(core.students):
             self.run_action(core.request_preview, ip)
@@ -846,8 +936,10 @@ class MainWindow(QMainWindow):
         if not self.current_ip:
             QMessageBox.information(self, '尚未选择终端', '请先选择收件终端。')
             return
-        self.run_action(core.send_chat, self.current_ip, text)
-        self.chat_input.clear()
+        result = self.run_action(core.send_chat, self.current_ip, text)
+        if result is not False:
+            self.append_chat(self.current_ip, text, outgoing=True)
+            self.chat_input.clear()
 
     def blackscreen_dialog(self, ip):
         dialog = QDialog(self)
@@ -974,8 +1066,8 @@ class MainWindow(QMainWindow):
             return
         self.shutting_down = True
         self.timer.stop()
-        gui_events.preview_events.disconnect(self.bridge.preview.emit)
-        gui_events.log_events.disconnect(self.bridge.log.emit)
+        for channel, callback in self.event_callbacks:
+            channel.disconnect(callback)
         core.shutdown()
         event.accept()
 
@@ -987,7 +1079,8 @@ QFrame#rail { background: #080d15; border-right: 1px solid #1b2635; }
 QFrame#rail QLabel { background: transparent; }
 QLabel#logo { background: #63e6d4; color: #081310; border-radius: 10px; font-size: 25px; font-weight: 900; min-height: 44px; max-height: 44px; }
 QPushButton#railButton { background: transparent; border: 0; border-radius: 10px; }
-QPushButton#railButton:hover { background: #142131; }
+QPushButton#railButton:hover, QPushButton#channelSettings:hover { background: #142131; }
+QPushButton#channelSettings { background: transparent; border: 0; padding: 0; }
 QPushButton#railButton:checked { background: #173432; border-left: 2px solid #63e6d4; }
 QLabel#channelBadge { color: #63e6d4; border: 1px solid #28534f; border-radius: 8px; padding: 8px 0; font-family: "Cascadia Mono", monospace; font-weight: 700; }
 QFrame#topbar { background: #0e151f; border-bottom: 1px solid #1c2735; }

@@ -2,6 +2,7 @@ temp/
 __pycache__/
 *.py[cod]
 *.log
+classroom_config.json
 .venv/
 venv/
 .build/

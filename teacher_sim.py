@@ -2196,6 +2196,9 @@ def handle_mess(d, sip, sp, via='unknown'):
 
     try:
         magic, sender_id, rcpt_count = struct.unpack('<III', d[:12])
+        if rcpt_count > 64:
+            logger.warning('[MESS] 接收者数量无效 from %s:%d (rcpt_count=%d)', sip, sp, rcpt_count)
+            return
         header_len = 12 + 4 * rcpt_count
         if len(d) < header_len:
             logger.warning('[MESS] 头长度不足 from %s:%d (rcpt_count=%d)', sip, sp, rcpt_count)
@@ -2308,6 +2311,11 @@ def handle_mess(d, sip, sp, via='unknown'):
     if text:
         if msg_kind == 'chat':
             logger.info('[MESS] 来自 %s:%d 的聊天消息：%s', sip, sp, text)
+            try:
+                from gui_events import chat_events
+                chat_events.publish(sip, text)
+            except ImportError:
+                pass
         elif last_status.get((sip, dedupe_key)) == text:
             # 内容无变化的同类消息（周期性窗口标题/WiFi/列表分片）只记 DEBUG
             logger.debug('[MESS] 来自 %s:%d 的状态消息(重复)：%s', sip, sp, text)
