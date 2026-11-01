@@ -2393,6 +2393,26 @@ def build_session_reply(recipient_ip, msg_type):
             + payload)
 
 
+def handle_student_anno(d, sip):
+    """解析学生端单播的 64 字节课堂状态块（0x41A590 / 0x43D870）。"""
+    if len(d) != 72 or sip not in students:
+        return False
+    fields = struct.unpack_from('<16I', d, 8)
+    state = {
+        'blackscreen_flags': fields[1],
+        'student_flags': fields[2],
+        'hand_up': bool(fields[2] & 0x100000),
+        'raw': fields,
+    }
+    previous = students[sip].get('anno_state')
+    students[sip]['anno_state'] = state
+    if previous != state:
+        logger.info('[StudentState] %s hand_up=%s flags=%#010x lock=%#010x raw=%s',
+                    sip, state['hand_up'], state['student_flags'],
+                    state['blackscreen_flags'], ' '.join(f'{v:08x}' for v in fields))
+    return True
+
+
 def session_recv():
     logger.info('[SessionRecv] 启动')
     sock2.settimeout(1)
@@ -2459,6 +2479,9 @@ def session_recv():
 
             elif mag == 0x5353454D:  # MESS 学生端发来的消息
                 handle_mess(d, sip, sp, 'SessionRecv')
+
+            elif mag == 0x4F4E4E41:  # ANNO 学生端课堂状态
+                handle_student_anno(d, sip)
 
             elif mag not in ROUTINE_MAGICS:
                 # 非日常广播包才记录，减少噪音

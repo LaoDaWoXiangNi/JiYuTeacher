@@ -219,9 +219,9 @@ class StudentCard(QFrame):
         self.name.setObjectName('cardName')
         title_row.addWidget(self.name)
         title_row.addStretch()
-        live = QLabel('●  ONLINE')
-        live.setObjectName('liveLabel')
-        title_row.addWidget(live)
+        self.live = QLabel('●  ONLINE')
+        self.live.setObjectName('liveLabel')
+        title_row.addWidget(self.live)
         body.addLayout(title_row)
         self.address = QLabel(ip)
         self.address.setObjectName('monoMuted')
@@ -252,6 +252,11 @@ class StudentCard(QFrame):
         self.name.setText(name)
         self.name.setToolTip(name)
         self.address.setText(f'{self.ip}  /  {user}' if user else self.ip)
+        hand_up = student.get('anno_state', {}).get('hand_up', False)
+        self.live.setText('▲  HAND UP' if hand_up else '●  ONLINE')
+        self.live.setProperty('handUp', hand_up)
+        self.live.style().unpolish(self.live)
+        self.live.style().polish(self.live)
 
     def set_selected(self, selected):
         self.setProperty('selected', selected)
@@ -645,7 +650,9 @@ class MainWindow(QMainWindow):
             self.cards[ip].set_selected(ip == self.current_ip)
         if self.current_ip not in current:
             self.current_ip = next(iter(sorted(current)), None)
-        self.online_stat.setText(f'{len(current):02d} ONLINE')
+        hand_up_count = sum(student.get('anno_state', {}).get('hand_up', False)
+                            for student in core.students.values())
+        self.online_stat.setText(f'{len(current):02d} ONLINE / {hand_up_count:02d} HAND UP')
         self.view_stat.setText(f'{len(core.remote_views):02d} STREAMS')
         self.screen_count.setText(f'{len(current):02d} DEVICES')
         self.refresh_student_table()
@@ -727,9 +734,13 @@ class MainWindow(QMainWindow):
             ('系统版本', 'osver'), ('CPU 厂商', 'cpu_vendor'),
             ('CPU 型号', 'cpu_model'), ('内存', 'mem'),
         )
-        self.info_text.setPlainText('\n'.join(
+        anno = student.get('anno_state', {})
+        status = (f'举手：{"是" if anno.get("hand_up") else "否"}\n'
+                  f'学生状态：0x{anno.get("student_flags", 0):08X}\n'
+                  f'黑屏状态：0x{anno.get("blackscreen_flags", 0):08X}')
+        self.info_text.setPlainText(('\n'.join(
             f'{label}：{self.current_ip if key is None else info.get(key, "待上报")}'
-            for label, key in labels) if self.current_ip else '请先从左侧选择终端。')
+            for label, key in labels) + '\n' + status) if self.current_ip else '请先从左侧选择终端。')
         self.fill_id_name_table(self.process_table, student.get('processes', []), False)
         self.fill_id_name_table(self.window_table, student.get('windows', []), True)
 
@@ -973,6 +984,7 @@ QFrame#studentCard[selected="true"] { border: 1px solid #63e6d4; }
 QFrame#studentCard PreviewWidget { background: #080d14; border-top-left-radius: 9px; border-top-right-radius: 9px; }
 QLabel#cardName { font-size: 14px; font-weight: 700; color: #e4ebf3; }
 QLabel#liveLabel { color: #63e6d4; font-size: 9px; font-weight: 700; }
+QLabel#liveLabel[handUp="true"] { color: #f3bd65; font-size: 10px; }
 QLabel#emptyTitle { font-size: 21px; font-weight: 700; color: #c1ccda; }
 QFrame#panel { background: #0e1621; border: 1px solid #202d3d; border-radius: 9px; }
 QLabel#panelCaption { font-size: 14px; font-weight: 700; padding: 16px; background: transparent; }
