@@ -253,7 +253,10 @@ class StudentCard(QFrame):
         self.name.setToolTip(name)
         self.address.setText(f'{self.ip}  /  {user}' if user else self.ip)
         hand_up = student.get('anno_state', {}).get('hand_up', False)
-        self.live.setText('▲  HAND UP' if hand_up else '●  ONLINE')
+        has_submit = 'submit_request' in student
+        self.live.setText('▲  FILE SUBMIT' if has_submit else
+                          ('▲  HAND UP' if hand_up else '●  ONLINE'))
+        self.live.setProperty('handUp', hand_up or has_submit)
         self.live.setProperty('handUp', hand_up)
         self.live.style().unpolish(self.live)
         self.live.style().polish(self.live)
@@ -738,6 +741,12 @@ class MainWindow(QMainWindow):
         status = (f'举手：{"是" if anno.get("hand_up") else "否"}\n'
                   f'学生状态：0x{anno.get("student_flags", 0):08X}\n'
                   f'黑屏状态：0x{anno.get("blackscreen_flags", 0):08X}')
+        submit = student.get('submit_request')
+        if submit:
+            status += (f'\n文件提交：{submit["file_count"]} 个文件，{submit["total_size"]} 字节\n'
+                       f'目录：{submit["directory"]}\n'
+                       f'列表：{submit["file_list"]}\n'
+                       f'事务：{submit["transaction_guid"]}（仅监测，未接受）')
         self.info_text.setPlainText(('\n'.join(
             f'{label}：{self.current_ip if key is None else info.get(key, "待上报")}'
             for label, key in labels) + '\n' + status) if self.current_ip else '请先从左侧选择终端。')

@@ -2498,6 +2498,29 @@ def session_recv():
     logger.info('[SessionRecv] 退出')
 
 
+def handle_submit_request(d, sip):
+    """解析 QRMS 文件提交请求（LibBaseTrans 0x100031B0）。"""
+    if len(d) != 0x284 or sip not in students:
+        return False
+    transaction_guid = d[12:28].hex()
+    fields = struct.unpack_from('<8I', d, 28)
+    directory = d[60:124].decode('utf-16-le', errors='replace').split('\x00')[0]
+    file_list = d[124:644].decode('utf-16-le', errors='replace').split('\x00')[0]
+    total_size = fields[5] | (fields[6] << 32)
+    request = {
+        'transaction_guid': transaction_guid,
+        'directory': directory,
+        'file_list': file_list,
+        'file_count': fields[7],
+        'total_size': total_size,
+        'fields': fields,
+    }
+    students[sip]['submit_request'] = request
+    logger.info('[FileSubmit] %s guid=%s files=%d bytes=%d directory=%s list=%s fields=%s',
+                sip, transaction_guid, fields[7], total_size, directory, file_list, fields)
+    return True
+
+
 def main_recv():
     global running
     logger.info('[MainRecv] 启动')
@@ -2577,6 +2600,9 @@ def main_recv():
 
             elif mag == 0x5353454D:  # MESS 学生端发来的消息
                 handle_mess(d, sip, sp, 'MainRecv')
+
+            elif mag == 0x534D5251:  # QRMS 学生文件提交请求
+                handle_submit_request(d, sip)
 
             else:
                 logger.warning('[MainRecv] 未知包 %s from %s:%d, len=%d\n%s',
