@@ -7,6 +7,8 @@
 """
 import socket, struct, threading, time, random, sys, os, uuid, colorsys, ipaddress
 import logging, logging.handlers
+import queue
+from classroom_store import ClassroomStore
 from PIL import Image, ImageOps
 import io
 import subprocess
@@ -137,11 +139,166 @@ preview_policy_versions = {}   # sip -> 最近发送的 LPNT policy version
 remote_views = {}  # sip -> RemoteViewSession
 remote_controls = {}  # sip -> {'port': int, 'sock': socket.socket}
 screen_broadcasts = {}  # sip -> 广播启动参数；媒体推流会话单独管理
+student_demos = {}  # source sip -> 已发送 feature 4 的接收者；媒体监看单独管理
 remote_view_failures = {}  # sip -> 最近失败时间；避免反复触发学生端编码器
 remote_state_lock = threading.RLock()
 last_status = {}  # (sip, key) -> 最近一条同类消息内容（重复降为 DEBUG，防止刷屏）
 running = True
 SELECTED_NETWORK = None
+
+classroom_store = ClassroomStore()
+try:
+    classroom_active_class = classroom_store.get_active_class()
+except Exception as error:
+    classroom_active_class = None
+    logger.error('[Classroom] 启动读取当前班级失败 path=%s error=%s',
+                 classroom_store.path, error, exc_info=True)
+classroom_observer = None
+classroom_observer_lock = threading.RLock()
+classroom_write_queue = queue.Queue()
+classroom_write_thread = None
+classroom_checked_in = set()
+classroom_lock = threading.RLock()
+classroom_shutdown = False
+
+
+def bind_classroom_observer(callback):
+    """注册班级变化回调；回调在 GUI 事件或写盘线程中收到轻量事件。"""
+    if not callable(callback):
+        raise TypeError('班级 observer 必须可调用')
+    global classroom_observer
+    with classroom_observer_lock:
+        classroom_observer = callback
+
+
+def unbind_classroom_observer(callback=None):
+    global classroom_observer
+    with classroom_observer_lock:
+        if callback is None or callback is classroom_observer:
+            classroom_observer = None
+
+
+def _classroom_notify(event):
+    with classroom_observer_lock:
+        callback = classroom_observer
+    if callback is None:
+        return
+    try:
+        callback(event)
+    except Exception as error:
+        logger.error('[Classroom] observer 处理失败 event=%s error=%s',
+                     event.get('kind'), error, exc_info=True)
+
+
+def _checkout_all_now():
+    with classroom_lock:
+        targets = list(classroom_checked_in)
+        classroom_checked_in.clear()
+    if not targets:
+        return
+    grouped = {}
+    for class_name, student_key in targets:
+        grouped.setdefault(class_name, []).append(student_key)
+    for class_name, keys in grouped.items():
+        try:
+            classroom_store.check_out_students(class_name, keys)
+            for student_key in keys:
+                logger.info('[Classroom] 退出签退 class=%s student_key=%s',
+                            class_name, student_key)
+        except Exception as error:
+            logger.error('[Classroom] 退出签退失败 class=%s students=%s error=%s',
+                         class_name, keys, error, exc_info=True)
+            _classroom_notify({'kind': 'error', 'operation': '退出签退',
+                               'class_name': class_name, 'error': error})
+    logger.info('[Classroom] 本次运行签退完成 count=%d', len(targets))
+
+
+def _classroom_writer():
+    while True:
+        item = classroom_write_queue.get()
+        try:
+            if item is None:
+                _checkout_all_now()
+                break
+            action, event = item
+            try:
+                result = action()
+                event['result'] = result
+                if event['kind'] == 'student_info':
+                    if result is None:
+                        logger.info('[Classroom] 忽略未导入学生 ip=%s', event['ip'])
+                    else:
+                        with classroom_lock:
+                            if result['checked_in']:
+                                classroom_checked_in.add(
+                                    (event['class_name'], result['student_key']))
+                        logger.info('[Classroom] 学生信息已更新 class=%s ip=%s '
+                                    'student_key=%s check_in=%s', event['class_name'],
+                                    event['ip'], result['student_key'],
+                                    result['checked_in'])
+                _classroom_notify(event)
+            except Exception as error:
+                event['error'] = error
+                logger.error('[Classroom] 数据操作失败 kind=%s class=%s ip=%s '
+                             'student_key=%s error=%s', event['kind'],
+                             event.get('class_name'), event.get('ip'),
+                             event.get('student_key'), error, exc_info=True)
+                _classroom_notify(event)
+        finally:
+            classroom_write_queue.task_done()
+
+
+def _start_classroom_writer():
+    global classroom_write_thread
+    with classroom_lock:
+        if classroom_write_thread is None or not classroom_write_thread.is_alive():
+            classroom_write_thread = threading.Thread(
+                target=_classroom_writer, name='classroom-writer', daemon=True)
+            classroom_write_thread.start()
+
+
+def _queue_classroom_write(action, event):
+    if classroom_shutdown:
+        logger.error('[Classroom] 程序正在退出，拒绝新数据操作 kind=%s', event['kind'])
+        return False
+    _start_classroom_writer()
+    classroom_write_queue.put((action, event))
+    return True
+
+
+def set_active_class(class_name):
+    classroom_store.set_active_class(class_name)
+    global classroom_active_class
+    with classroom_lock:
+        classroom_active_class = class_name
+    logger.info('[Classroom] 当前班级已切换 class=%s', class_name)
+    return class_name
+
+
+def handle_classroom_student_info(sip, info):
+    with classroom_lock:
+        if classroom_shutdown:
+            return False
+        class_name = classroom_active_class
+        if not class_name:
+            return False
+        event = {'kind': 'student_info', 'class_name': class_name, 'ip': sip,
+                 'student_key': None}
+        name = info.get('name', '')
+        user = info.get('user', '')
+        action = lambda: classroom_store.report_student_online(
+            class_name, sip, name, user)
+        return _queue_classroom_write(action, event)
+
+
+def import_online_students():
+    """返回需要 GUI 导入的在线学生；不会由网络 handler 自动建档。"""
+    result = []
+    for sip, student in list(students.items()):
+        info = student.get('info', {})
+        result.append({'ip': sip, 'computer_name': info.get('name', ''),
+                       'user_name': info.get('user', '')})
+    return result
 
 
 def hexdump(data, width=16):
@@ -363,7 +520,8 @@ ip = get_ip()
 
 
 def get_channel_id():
-    raw = os.environ.get('TEACHER_CHANNEL', '1').strip()
+    from app_config import load_channel
+    raw = os.environ.get('TEACHER_CHANNEL', str(load_channel())).strip()
     try:
         channel = int(raw, 0)
     except ValueError as e:
@@ -657,6 +815,63 @@ def stop_screen_broadcast(sip):
                  (sip, SPORT))
     screen_broadcasts.pop(sip, None)
     logger.info('[Broadcast] feature 1 停止包已发送 -> %s', sip)
+    return True
+
+
+def build_student_demo_payload(port):
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        raise ValueError('实验性语音监听端口必须在 1 到 65535 之间')
+    payload = (struct.pack('<IIIIIII', 35, 1, 0, 7, 0, 4, 0)
+               + socket.inet_aton(ip) + struct.pack('<H', port) + b'\x00')
+    if len(payload) != 35:
+        raise AssertionError('feature 4 学生演示最小控制包长度错误')
+    return payload
+
+
+def start_student_demo(source_ip, port=None):
+    if not _check_student(source_ip, 'demo <演示学生IP>'):
+        return False
+    if port is None:
+        raw_port = os.environ.get('TEACHER_DEMO_VOICE_PORT', '').strip()
+        if not raw_port:
+            raise ValueError('请提供实验性语音监听端口；屏幕演示尚未实现')
+        try:
+            port = int(raw_port, 0)
+        except ValueError as error:
+            raise ValueError('TEACHER_DEMO_VOICE_PORT 必须是有效端口') from error
+    if student_demos:
+        raise ValueError('已有学生演示进行中，请先停止')
+    if source_ip in screen_broadcasts:
+        raise ValueError('请先停止该学生的教师屏幕广播')
+    payload = build_student_demo_payload(port)
+    sock2.sendto(build_mess_packet(source_ip, payload), (source_ip, SPORT))
+    student_demos[source_ip] = {'recipients': [source_ip], 'monitoring': False,
+                                'port': port, 'started_at': time.time(), 'scope': 'voice-control'}
+    logger.info('[Demo] feature 4 语音启动控制 -> %s port=%d；屏幕分发与监看尚未实现',
+                source_ip, port)
+    return True
+
+
+def stop_student_demo(source_ip=None):
+    if source_ip is None:
+        if len(student_demos) != 1:
+            raise ValueError('请指定要停止的演示学生')
+        source_ip = next(iter(student_demos))
+    state = student_demos.get(source_ip)
+    if state is None:
+        raise ValueError('该学生没有进行中的演示')
+    payload = struct.pack('<IIIIIII', 29, 1, 0, 0, 0, 4, 0x10000000) + b'\x00'
+    errors = []
+    for recipient in state['recipients']:
+        try:
+            sock2.sendto(build_mess_packet(recipient, payload), (recipient, SPORT))
+        except OSError as error:
+            errors.append((recipient, error))
+    if errors:
+        raise OSError(f'演示停止包发送失败：{errors}')
+    student_demos.pop(source_ip, None)
+    logger.info('[Demo] feature 4 语音停止控制已发送 source=%s recipients=%s',
+                source_ip, state['recipients'])
     return True
 
 
@@ -1818,6 +2033,7 @@ def _parse_student_info(payload, sip):
     }
     if sip in students:
         students[sip]['info'] = info
+        handle_classroom_student_info(sip, info)
     return info
 
 
@@ -2441,6 +2657,7 @@ def handle_student_anno(d, sip):
         'blackscreen_flags': fields[1],
         'student_flags': fields[2],
         'hand_up': bool(fields[2] & 0x100000),
+        'student_demo': bool(fields[0] & 0x04),
         'raw': fields,
     }
     previous = students[sip].get('anno_state')
@@ -3249,6 +3466,7 @@ def command_loop():
 
 def start_background_threads():
     logger.info('启动 4 个后台线程')
+    _start_classroom_writer()
     for name, target in (
         ('broadcast', broadcast), ('session_anno', session_anno),
         ('session_recv', session_recv), ('main_recv', main_recv),
@@ -3257,8 +3475,14 @@ def start_background_threads():
 
 
 def shutdown():
-    global running
+    global running, classroom_shutdown
     running = False
+    with classroom_lock:
+        if not classroom_shutdown:
+            classroom_shutdown = True
+            _start_classroom_writer()
+            classroom_write_queue.put(None)
+    classroom_write_queue.join()
     for timer in list(blackscreen_timers.values()):
         timer.cancel()
     blackscreen_timers.clear()
@@ -3271,6 +3495,11 @@ def shutdown():
             stop_screen_broadcast(sip)
         except OSError as error:
             logger.warning('[Broadcast] 退出时停止 %s 失败：%s', sip, error)
+    for source_ip in list(student_demos):
+        try:
+            stop_student_demo(source_ip)
+        except OSError as error:
+            logger.warning('[Demo] 退出时停止 %s 失败：%s', source_ip, error)
     for network_socket in (sock, sock2):
         try:
             network_socket.close()

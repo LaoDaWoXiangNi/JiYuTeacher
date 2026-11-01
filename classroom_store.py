@@ -74,11 +74,21 @@ def _student_key(value):
 
 
 def _new_document():
-    return {'schema_version': SCHEMA_VERSION, 'classes': {}}
+    return {'schema_version': SCHEMA_VERSION, 'classes': {}, 'active_class': None}
 
 
 def _new_class(name):
     return {'name': name, 'students': {}, 'groups': {}, 'attendance': {}}
+
+
+def _active_class(document):
+    active_class = document.get('active_class')
+    if active_class is None:
+        return None
+    if (not isinstance(active_class, str) or not active_class.strip()
+            or active_class not in document['classes']):
+        raise StorageError('班级数据 active_class 必须引用已有班级或为 null')
+    return active_class
 
 
 class ClassroomStore:
@@ -105,6 +115,7 @@ class ClassroomStore:
             raise StorageError('班级数据 classes 必须是 JSON 对象')
         for name, classroom in document['classes'].items():
             self._validate_class(name, classroom)
+        _active_class(document)
         return document
 
     def _validate_class(self, name, classroom):
@@ -215,6 +226,16 @@ class ClassroomStore:
         except KeyError as error:
             raise NotFoundError(f'学生不存在：{student_key!r}') from error
 
+    def _student_for_ip(self, classroom, value):
+        value = _ip(value)
+        matches = [item for item in classroom['students'].items()
+                   if item[1]['ip'] == value]
+        if not matches:
+            return None
+        if len(matches) > 1:
+            raise ValidationError(f'班级内 IP 重复，无法唯一匹配学生：{value}')
+        return matches[0]
+
     def _group(self, classroom, group_name):
         group_name = _text(group_name, '分组名称')
         try:
@@ -239,6 +260,22 @@ class ClassroomStore:
         with self._lock:
             _, classroom = self._class(self._load(), class_name)
             return copy.deepcopy(classroom)
+
+    def get_active_class(self):
+        with self._lock:
+            return _active_class(self._load())
+
+    def set_active_class(self, class_name):
+        if class_name is not None:
+            class_name = _text(class_name, '班级名称')
+
+        def update(document):
+            if class_name is not None:
+                self._class(document, class_name)
+            document['active_class'] = class_name
+            return class_name
+
+        return self._mutate(update)
 
     def create_class(self, name):
         name = _text(name, '班级名称')
@@ -271,6 +308,8 @@ class ClassroomStore:
         def delete(document):
             self._class(document, class_name)
             del document['classes'][class_name]
+            if document.get('active_class') == class_name:
+                document['active_class'] = None
 
         self._mutate(delete)
 
@@ -288,6 +327,8 @@ class ClassroomStore:
             _, classroom = self._class(document, class_name)
             if student['student_key'] in classroom['students']:
                 raise DuplicateError(f"学生已存在：{student['student_key']!r}")
+            if self._student_for_ip(classroom, student['ip']) is not None:
+                raise DuplicateError(f"班级内 IP 已存在：{student['ip']}")
             classroom['students'][student['student_key']] = student
             return student
 
@@ -300,6 +341,9 @@ class ClassroomStore:
             _, student = self._student(classroom, student_key)
             if ip is not None:
                 student['ip'] = _ip(ip)
+                match = self._student_for_ip(classroom, student['ip'])
+                if match is not None and match[0] != student_key:
+                    raise DuplicateError(f"班级内 IP 已存在：{student['ip']}")
             if computer_name is not None:
                 student['computer_name'] = _optional_text(
                     computer_name, 'computer_name')
@@ -448,6 +492,33 @@ class ClassroomStore:
             raise ValidationError('签到时间必须包含时区')
         return value.isoformat()
 
+    def report_student_online(self, class_name, ip, computer_name='', user_name='',
+                              when=None):
+        """更新已导入学生的信息，并仅在未在线到在线时原子签到。"""
+        ip = _ip(ip)
+        computer_name = _optional_text(computer_name, 'computer_name')
+        user_name = _optional_text(user_name, 'user_name')
+        when = self._timestamp(when)
+
+        def update(document):
+            _, classroom = self._class(document, class_name)
+            match = self._student_for_ip(classroom, ip)
+            if match is None:
+                return None
+            student_key, student = match
+            student['computer_name'] = computer_name
+            student['user_name'] = user_name
+            record = self._attendance(classroom, student_key)
+            checked_in = not record['online']
+            if checked_in:
+                record['check_in_count'] += 1
+                record['last_check_in'] = when
+                record['online'] = True
+            return {'student_key': student_key, 'checked_in': checked_in,
+                    'student': student, 'attendance': record}
+
+        return self._mutate(update)
+
     def check_in(self, class_name, student_key, when=None):
         when = self._timestamp(when)
 
@@ -471,6 +542,25 @@ class ClassroomStore:
             record['last_check_out'] = when
             record['online'] = False
             return record
+
+        return self._mutate(update)
+
+    def check_out_students(self, class_name, student_keys, when=None):
+        """签退本次已签到的学生；已离线记录不重复计数。"""
+        student_keys = list(student_keys)
+        when = self._timestamp(when)
+
+        def update(document):
+            _, classroom = self._class(document, class_name)
+            result = {}
+            for student_key in student_keys:
+                record = self._attendance(classroom, student_key)
+                if record['online']:
+                    record['check_out_count'] += 1
+                    record['last_check_out'] = when
+                    record['online'] = False
+                result[student_key] = record
+            return result
 
         return self._mutate(update)
 

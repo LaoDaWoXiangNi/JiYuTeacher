@@ -97,8 +97,9 @@ def build_chat(teacher_ip: str, text: str) -> bytes:
 
 
 def build_anno(hand_up: bool = False, blackscreen_flags: int = 0,
-               student_flags: int = 0) -> bytes:
+               student_flags: int = 0, student_demo: bool = False) -> bytes:
     state = [0] * 16
+    state[0] = 0x04 if student_demo else 0
     state[1] = blackscreen_flags & 0xFFFFFFFF
     state[2] = (student_flags | (HAND_UP_FLAG if hand_up else 0)) & 0xFFFFFFFF
     result = struct.pack('<II', MAGIC_ANNO, 0x10000) + struct.pack('<16I', *state)

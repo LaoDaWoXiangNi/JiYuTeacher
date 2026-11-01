@@ -4,7 +4,7 @@ import sys
 import time
 from functools import partial
 
-from PyQt6.QtCore import QObject, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, QRectF, QSize, Qt, QTimer, QDateTime, pyqtSignal
 from PyQt6.QtGui import (
     QColor, QFont, QFontDatabase, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap,
 )
@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
     QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
     QPushButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter, QStackedWidget,
+    QFileDialog, QInputDialog,
     QTabWidget, QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -146,6 +147,12 @@ def icon(name, color=CYAN, size=20):
         line(3, 9, 21, 9)
         for x in (7, 12, 17):
             painter.drawEllipse(QRectF(x - 1, 5.5, 2, 2))
+    elif name == 'classroom':
+        rect(3, 4, 18, 16)
+        line(3, 9, 21, 9)
+        line(8, 9, 8, 20)
+        painter.drawEllipse(QRectF(10, 11, 4, 4))
+        line(10, 18, 16, 18)
     painter.end()
     return QIcon(image)
 
@@ -154,6 +161,7 @@ class UiBridge(QObject):
     preview = pyqtSignal(str, object)
     log = pyqtSignal(str, int)
     chat = pyqtSignal(str, str)
+    classroom = pyqtSignal(object)
 
 
 class CardScrollArea(QScrollArea):
@@ -351,6 +359,8 @@ class MainWindow(QMainWindow):
         self.bridge.preview.connect(self.set_preview)
         self.bridge.log.connect(self.append_log)
         self.bridge.chat.connect(self.append_chat)
+        self.bridge.classroom.connect(self.classroom_changed)
+        core.bind_classroom_observer(self.bridge.classroom.emit)
         self.event_callbacks = (
             (gui_events.preview_events, self.bridge.preview.emit),
             (gui_events.log_events, self.bridge.log.emit),
@@ -363,6 +373,7 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.refresh_students)
         self.timer.start(800)
         self.refresh_students()
+        self.refresh_classroom()
         core.logger.info('教师端在线 · %s · 频道 %d', core.ip, core.CHANNEL_ID)
 
     def build_ui(self):
@@ -381,6 +392,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.create_management())
         self.pages.addWidget(self.create_messages())
         self.pages.addWidget(self.create_logs())
+        self.pages.addWidget(self.create_classroom())
         body.addWidget(self.pages, 1)
         body.addWidget(self.create_statusbar())
         shell.addLayout(body, 1)
@@ -401,6 +413,7 @@ class MainWindow(QMainWindow):
         for index, glyph, tooltip in (
             (0, 'grid', '课堂'), (1, 'devices', '终端'),
             (2, 'message', '消息'), (3, 'terminal', '日志'),
+            (4, 'classroom', '班级'),
         ):
             button = QPushButton(icon(glyph, '#8290a4', 23), '')
             button.setObjectName('railButton')
@@ -595,6 +608,7 @@ class MainWindow(QMainWindow):
             ('请求预览', 'monitor', lambda: self.selected(core.request_preview)),
             ('连续观看', 'eye', lambda: self.selected(self.start_view)),
             ('屏幕广播', 'monitor', self.toggle_broadcast),
+            ('学生演示', 'devices', self.toggle_student_demo),
             ('远程控制', 'cursor', lambda: self.selected(self.start_control)),
             ('发送消息', 'message', lambda: self.selected(self.chat_dialog)),
             ('黑屏安静', 'lock', lambda: self.selected(self.blackscreen_dialog)),
@@ -693,6 +707,384 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.log_text)
         return page
 
+    def create_classroom(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(30, 24, 30, 24)
+        layout.setSpacing(14)
+        toolbar = QHBoxLayout()
+        self.class_selector = QComboBox()
+        self.class_selector.setEditable(True)
+        self.class_selector.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.class_selector.setMinimumWidth(240)
+        self.class_selector.setPlaceholderText('选择班级，或输入名称后新建')
+        self.class_selector.activated.connect(self.select_active_class)
+        toolbar.addWidget(self.class_selector)
+        for text, callback in (
+                ('新建班级', self.create_classroom_class),
+                ('导入在线学生', self.import_classroom_students),
+                ('导出签到 CSV', self.export_classroom_csv)):
+            button = QPushButton(text)
+            button.clicked.connect(callback)
+            toolbar.addWidget(button)
+        toolbar.addStretch()
+        layout.addLayout(toolbar)
+        self.classroom_stats = QLabel('尚未选择班级')
+        self.classroom_stats.setObjectName('counter')
+        layout.addWidget(self.classroom_stats, 0, Qt.AlignmentFlag.AlignLeft)
+        self.classroom_status = QLabel('自动签到仅处理当前班级已导入的学生。')
+        self.classroom_status.setObjectName('muted')
+        layout.addWidget(self.classroom_status)
+        splitter = QSplitter()
+        group_panel = QFrame()
+        group_panel.setObjectName('panel')
+        group_layout = QVBoxLayout(group_panel)
+        group_layout.setContentsMargins(0, 0, 0, 12)
+        group_caption = QLabel('分组与成员')
+        group_caption.setObjectName('panelCaption')
+        group_layout.addWidget(group_caption)
+        self.group_table = QTableWidget(0, 3)
+        self.group_table.setHorizontalHeaderLabels(('分组', '人数', '组长'))
+        self.group_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.group_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.group_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.group_table.verticalHeader().setVisible(False)
+        self.group_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.group_table.itemSelectionChanged.connect(self.refresh_group_details)
+        group_layout.addWidget(self.group_table)
+        group_buttons = QHBoxLayout()
+        for text, callback in (
+                ('新建', self.create_classroom_group),
+                ('重命名', self.rename_classroom_group),
+                ('删除', self.delete_classroom_group)):
+            button = QPushButton(text)
+            button.clicked.connect(callback)
+            group_buttons.addWidget(button)
+        group_layout.addLayout(group_buttons)
+        self.group_member_list = QListWidget()
+        self.group_member_list.setMaximumHeight(170)
+        group_layout.addWidget(self.group_member_list)
+        self.group_student_selector = QComboBox()
+        group_layout.addWidget(self.group_student_selector)
+        member_buttons = QHBoxLayout()
+        for text, callback in (
+                ('添加成员', self.add_classroom_member),
+                ('移除成员', self.remove_classroom_member),
+                ('设为组长', self.set_classroom_leader)):
+            button = QPushButton(text)
+            button.clicked.connect(callback)
+            member_buttons.addWidget(button)
+        group_layout.addLayout(member_buttons)
+        splitter.addWidget(group_panel)
+        attendance_panel = QFrame()
+        attendance_panel.setObjectName('panel')
+        attendance_layout = QVBoxLayout(attendance_panel)
+        attendance_layout.setContentsMargins(0, 0, 0, 0)
+        attendance_caption = QLabel('签到记录')
+        attendance_caption.setObjectName('panelCaption')
+        attendance_layout.addWidget(attendance_caption)
+        self.attendance_table = QTableWidget(0, 8)
+        self.attendance_table.setHorizontalHeaderLabels(
+            ('计算机', 'IP / 用户', '签到', '签退', '最近签到', '最近签退', '状态', '分组'))
+        self.attendance_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.attendance_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.attendance_table.verticalHeader().setVisible(False)
+        self.attendance_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents)
+        self.attendance_table.horizontalHeader().setStretchLastSection(True)
+        self.attendance_table.setAlternatingRowColors(True)
+        attendance_layout.addWidget(self.attendance_table)
+        splitter.addWidget(attendance_panel)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 5)
+        splitter.setSizes((390, 760))
+        layout.addWidget(splitter, 1)
+        return page
+
+    def classroom_error(self, operation, error):
+        core.logger.error('[UI] %s失败：%s', operation, error,
+                          exc_info=(type(error), error, error.__traceback__))
+        self.classroom_status.setText(f'{operation}失败：{error}')
+        QMessageBox.critical(self, operation, str(error))
+
+    def require_classroom(self):
+        name = core.classroom_active_class
+        if not name:
+            QMessageBox.information(self, '尚未选择班级', '请先选择或新建一个班级。')
+        return name
+
+    def refresh_classroom(self):
+        try:
+            names = core.classroom_store.list_classes()
+            active = core.classroom_active_class
+            self.class_selector.blockSignals(True)
+            self.class_selector.clear()
+            self.class_selector.addItems(names)
+            self.class_selector.setCurrentText(active or '')
+            self.class_selector.blockSignals(False)
+            self.classroom_data = (core.classroom_store.get_class(active)
+                                   if active in names else None)
+            self.refresh_classroom_tables()
+        except Exception as error:
+            self.classroom_data = None
+            self.classroom_status.setText(f'读取班级数据失败：{error}')
+            core.logger.error('[UI] 读取班级数据失败：%s', error, exc_info=True)
+            if self.isVisible():
+                QMessageBox.critical(self, '读取班级数据失败', str(error))
+
+    def classroom_changed(self, event):
+        if event.get('error') is not None:
+            self.classroom_error('自动班级数据操作', event['error'])
+        elif event.get('kind') == 'student_info':
+            result = event.get('result')
+            if result is not None:
+                self.classroom_status.setText(
+                    f"{event['ip']} 信息已更新" +
+                    ('，本次签到成功。' if result['checked_in'] else '，无需重复签到。'))
+        self.refresh_classroom()
+
+    def refresh_classroom_tables(self):
+        classroom = self.classroom_data
+        if classroom is None:
+            self.classroom_stats.setText('尚未选择班级')
+            self.group_table.setRowCount(0)
+            self.attendance_table.setRowCount(0)
+            self.refresh_group_details()
+            return
+        attendance = classroom['attendance']
+        students = classroom['students']
+        self.classroom_stats.setText(
+            f"{len(students)} 学生   {sum(r['online'] for r in attendance.values())} 在线   "
+            f"{sum(r['check_in_count'] for r in attendance.values())} 签到   "
+            f"{sum(r['check_out_count'] for r in attendance.values())} 签退")
+        previous_group = self.selected_classroom_group(show_warning=False)
+        self.group_table.setRowCount(len(classroom['groups']))
+        selected_row = -1
+        for row, (name, group) in enumerate(classroom['groups'].items()):
+            leader = students.get(group['leader'], {}).get('computer_name', '—')
+            for column, value in enumerate((name, len(group['members']), leader or '—')):
+                item = QTableWidgetItem(str(value))
+                item.setData(Qt.ItemDataRole.UserRole, name)
+                self.group_table.setItem(row, column, item)
+                if name == previous_group:
+                    selected_row = row
+        if selected_row >= 0:
+            self.group_table.selectRow(selected_row)
+        self.refresh_group_details()
+        self.attendance_table.setRowCount(len(students))
+        for row, (key, student) in enumerate(students.items()):
+            record = attendance.get(key, {})
+            groups = [name for name, group in classroom['groups'].items()
+                      if key in group['members']]
+            values = (
+                student['computer_name'] or '未命名终端',
+                f"{student['ip']} / {student['user_name'] or '—'}",
+                record.get('check_in_count', 0), record.get('check_out_count', 0),
+                self.format_attendance_time(record.get('last_check_in')),
+                self.format_attendance_time(record.get('last_check_out')),
+                '在线' if record.get('online') else '离线', '、'.join(groups) or '—',
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setData(Qt.ItemDataRole.UserRole, key)
+                self.attendance_table.setItem(row, column, item)
+
+    @staticmethod
+    def format_attendance_time(value):
+        if not value:
+            return '—'
+        parsed = QDateTime.fromString(value, Qt.DateFormat.ISODate)
+        return (parsed.toLocalTime().toString('yyyy-MM-dd HH:mm:ss')
+                if parsed.isValid() else value)
+
+    def select_active_class(self):
+        name = self.class_selector.currentText().strip()
+        if name not in core.classroom_store.list_classes():
+            return
+        try:
+            core.set_active_class(name)
+            self.classroom_status.setText(f'当前班级：{name}')
+            self.refresh_classroom()
+        except Exception as error:
+            self.classroom_error('切换班级', error)
+
+    def create_classroom_class(self):
+        name = self.class_selector.currentText().strip()
+        try:
+            core.classroom_store.create_class(name)
+            core.set_active_class(name)
+            self.classroom_status.setText(f'已创建并选择班级：{name}')
+            self.refresh_classroom()
+        except Exception as error:
+            self.classroom_error('新建班级', error)
+
+    def import_classroom_students(self):
+        name = self.require_classroom()
+        if not name:
+            return
+        classroom = core.classroom_store.get_class(name)
+        existing = {student['ip'] for student in classroom['students'].values()}
+        imported = []
+        errors = []
+        for student in core.import_online_students():
+            if student['ip'] in existing:
+                continue
+            try:
+                core.classroom_store.add_student(name, **student)
+                imported.append(student)
+            except Exception as error:
+                errors.append(f"{student['ip']}：{error}")
+                core.logger.error('[UI] 导入学生失败 class=%s ip=%s error=%s',
+                                  name, student['ip'], error, exc_info=True)
+        for student in imported:
+            core.handle_classroom_student_info(
+                student['ip'], {'name': student['computer_name'],
+                                'user': student['user_name']})
+        self.refresh_classroom()
+        self.classroom_status.setText(f'已导入 {len(imported)} 名学生，跳过已有学生。')
+        if imported:
+            QMessageBox.information(
+                self, '导入完成', f'已导入 {len(imported)} 名学生。\n'
+                '已根据当前在线信息触发签到，后续重复上报不会重复计数。')
+        else:
+            QMessageBox.information(self, '没有新学生', '没有可导入的新在线学生。')
+        if errors:
+            QMessageBox.critical(self, '部分学生导入失败', '\n'.join(errors))
+
+    def export_classroom_csv(self):
+        name = self.require_classroom()
+        if not name:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, '导出签到 CSV', f'{name}_签到.csv', 'CSV 文件 (*.csv)')
+        if not path:
+            return
+        try:
+            core.classroom_store.export_attendance_csv(name, path, utf8_bom=True)
+            self.classroom_status.setText(f'签到 CSV 已导出：{path}')
+            core.logger.info('[UI] 签到 CSV 已导出 class=%s path=%s', name, path)
+            QMessageBox.information(self, '导出完成', f'签到记录已保存到：\n{path}')
+        except Exception as error:
+            self.classroom_error('导出签到 CSV', error)
+
+    def selected_classroom_group(self, show_warning=True):
+        item = self.group_table.item(self.group_table.currentRow(), 0)
+        name = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if not name and show_warning:
+            QMessageBox.information(self, '尚未选择分组', '请先选择一个分组。')
+        return name
+
+    def selected_classroom_member(self, show_warning=True):
+        item = self.group_member_list.currentItem()
+        key = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if not key and show_warning:
+            QMessageBox.information(self, '尚未选择成员', '请先在分组成员列表中选择学生。')
+        return key
+
+    def refresh_group_details(self):
+        self.group_member_list.clear()
+        self.group_student_selector.clear()
+        classroom = self.classroom_data
+        name = self.selected_classroom_group(show_warning=False)
+        if classroom is None or name not in classroom['groups']:
+            return
+        group = classroom['groups'][name]
+        for key in group['members']:
+            student = classroom['students'][key]
+            suffix = '（组长）' if key == group['leader'] else ''
+            item = QListWidgetItem(
+                f"{student['computer_name'] or key} · {student['ip']}{suffix}")
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            self.group_member_list.addItem(item)
+        for key, student in classroom['students'].items():
+            if key not in group['members']:
+                self.group_student_selector.addItem(
+                    f"{student['computer_name'] or key} · {student['ip']}", key)
+
+    def create_classroom_group(self):
+        name = self.require_classroom()
+        if not name:
+            return
+        group_name, accepted = QInputDialog.getText(self, '新建分组', '分组名称：')
+        if not accepted:
+            return
+        try:
+            core.classroom_store.create_group(name, group_name)
+            self.refresh_classroom()
+            matches = self.group_table.findItems(
+                group_name.strip(), Qt.MatchFlag.MatchExactly)
+            if matches:
+                self.group_table.selectRow(matches[0].row())
+        except Exception as error:
+            self.classroom_error('新建分组', error)
+
+    def rename_classroom_group(self):
+        name = self.require_classroom()
+        group_name = self.selected_classroom_group()
+        if not name or not group_name:
+            return
+        new_name, accepted = QInputDialog.getText(
+            self, '重命名分组', '新名称：', text=group_name)
+        if not accepted:
+            return
+        try:
+            core.classroom_store.rename_group(name, group_name, new_name)
+            self.refresh_classroom()
+        except Exception as error:
+            self.classroom_error('重命名分组', error)
+
+    def delete_classroom_group(self):
+        name = self.require_classroom()
+        group_name = self.selected_classroom_group()
+        if not name or not group_name:
+            return
+        if not self.confirm('删除分组', f'确定删除分组“{group_name}”吗？班级学生会保留。'):
+            return
+        try:
+            core.classroom_store.delete_group(name, group_name)
+            self.refresh_classroom()
+        except Exception as error:
+            self.classroom_error('删除分组', error)
+
+    def add_classroom_member(self):
+        name = self.require_classroom()
+        group_name = self.selected_classroom_group()
+        key = self.group_student_selector.currentData()
+        if not name or not group_name:
+            return
+        if key is None:
+            QMessageBox.information(self, '没有可添加学生', '该班级学生均已在当前分组中。')
+            return
+        try:
+            core.classroom_store.add_group_member(name, group_name, key)
+            self.refresh_classroom()
+        except Exception as error:
+            self.classroom_error('添加分组成员', error)
+
+    def remove_classroom_member(self):
+        name = self.require_classroom()
+        group_name = self.selected_classroom_group()
+        key = self.selected_classroom_member()
+        if not name or not group_name or not key:
+            return
+        try:
+            core.classroom_store.remove_group_member(name, group_name, key)
+            self.refresh_classroom()
+        except Exception as error:
+            self.classroom_error('移除分组成员', error)
+
+    def set_classroom_leader(self):
+        name = self.require_classroom()
+        group_name = self.selected_classroom_group()
+        key = self.selected_classroom_member()
+        if not name or not group_name or not key:
+            return
+        try:
+            core.classroom_store.set_group_leader(name, group_name, key)
+            self.refresh_classroom()
+        except Exception as error:
+            self.classroom_error('指定组长', error)
+
     def create_statusbar(self):
         bar = QFrame()
         bar.setObjectName('statusbar')
@@ -718,9 +1110,11 @@ class MainWindow(QMainWindow):
         self.pages.setCurrentIndex(index)
         for i, button in enumerate(self.nav_buttons):
             button.setChecked(i == index)
-            button.setIcon(icon(('grid', 'devices', 'message', 'terminal')[i],
+            button.setIcon(icon(('grid', 'devices', 'message', 'terminal', 'classroom')[i],
                                 CYAN if i == index else '#8290a4', 23))
-        self.page_title.setText(('课堂工作台', '终端管理', '消息中心', '事件日志')[index])
+        self.page_title.setText(('课堂工作台', '终端管理', '消息中心', '事件日志', '班级管理')[index])
+        if index == 4:
+            self.refresh_classroom()
 
     def channel_settings(self):
         dialog = ChannelSettingsDialog(self)
@@ -841,6 +1235,7 @@ class MainWindow(QMainWindow):
         )
         anno = student.get('anno_state', {})
         status = (f'举手：{"是" if anno.get("hand_up") else "否"}\n'
+                  f'语音演示位：{"是（无屏幕媒体）" if anno.get("student_demo") else "否"}\n'
                   f'学生状态：0x{anno.get("student_flags", 0):08X}\n'
                   f'黑屏状态：0x{anno.get("blackscreen_flags", 0):08X}')
         submit = student.get('submit_request')
@@ -947,6 +1342,28 @@ class MainWindow(QMainWindow):
                     self, '广播启动包已发送',
                     '学生端已收到 feature 1 启动参数。\n'
                     '当前版本尚未推送屏幕媒体流，这不代表学生端已经显示画面。')
+
+    def toggle_student_demo(self):
+        if not self.current_ip:
+            QMessageBox.information(self, '尚未选择终端', '请先选择演示学生。')
+            return
+        source_ip = self.current_ip
+        if source_ip in core.student_demos:
+            self.run_action(core.stop_student_demo, source_ip)
+            return
+        default_port = os.environ.get('TEACHER_DEMO_VOICE_PORT', '9000')
+        port, accepted = QInputDialog.getInt(self, '实验性语音控制', '语音监听端口（1–65535）：',
+                                             int(default_port), 1, 65535)
+        if not accepted:
+            return
+        detail = ('将向演示学生发送 feature 4 最小语音启停控制包。\n'
+                  '地址和端口取值尚未实机确认；屏幕分发与媒体监看尚未实现。')
+        if not self.confirm('实验性学生演示控制', f'演示学生：{source_ip}\n\n{detail}'):
+            return
+        core.logger.info('[UI] 实验性 feature 4 语音启停 source=%s port=%d', source_ip, port)
+        if self.run_action(core.start_student_demo, source_ip, port):
+            QMessageBox.information(self, '实验性控制包已发送',
+                                    '仅语音启停控制有静态证据；不代表学生屏幕已广播。')
 
     def card_action(self, action, ip):
         self.select_student(ip)
@@ -1131,6 +1548,7 @@ class MainWindow(QMainWindow):
             return
         self.shutting_down = True
         self.timer.stop()
+        core.unbind_classroom_observer(self.bridge.classroom.emit)
         for channel, callback in self.event_callbacks:
             channel.disconnect(callback)
         core.shutdown()

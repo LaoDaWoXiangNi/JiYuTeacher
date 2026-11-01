@@ -249,7 +249,9 @@ def run_self_test() -> int:
                                           struct.pack('<I', 1)), 'session', machine.config.teacher_ip)
         machine.handle_packet(teacher_mess(machine.config.bind_ip, 8, 0x80000000,
                                           struct.pack('<I', 8)), 'session', machine.config.teacher_ip)
-        assert machine.state.screen_broadcast and machine.state.remote_view
+        machine.handle_packet(teacher_mess(machine.config.bind_ip, 8, 0x80000000,
+                                          struct.pack('<I', 4)), 'session', machine.config.teacher_ip)
+        assert machine.state.screen_broadcast and machine.state.remote_view and machine.state.student_demo
         control = struct.pack('<III', 53, 8, 0) + b'MCMD' + struct.pack('<I', 2) + b'\x00' * 33
         machine.handle_packet(teacher_mess(machine.config.bind_ip, 8, 0, control[12:]),
                               'session', machine.config.teacher_ip)
@@ -259,7 +261,15 @@ def run_self_test() -> int:
                               'session', machine.config.teacher_ip)
         machine.handle_packet(teacher_mess(machine.config.bind_ip, 0, 0, b'\x00'),
                               'session', machine.config.teacher_ip)
+        machine.handle_packet(teacher_mess(machine.config.bind_ip, 0, 4, b'\x00'),
+                              'session', machine.config.teacher_ip)
+        for feature in (1, 4, 8):
+            machine.handle_packet(teacher_mess(machine.config.bind_ip, feature, 0x80000000),
+                                  'session', machine.config.teacher_ip)
+            machine.handle_packet(teacher_mess(machine.config.bind_ip, feature, 0x10000000),
+                                  'session', machine.config.teacher_ip)
         assert not machine.state.screen_broadcast and not machine.state.remote_view
+        assert not machine.state.student_demo
         lpnt = struct.pack('<III', protocol.MAGIC_LPNT, 0x10000, 20) + protocol.LPNT_GUID
         lpnt += struct.pack('<IIIII', 3, 1, 80, 60, 5)
         machine.handle_packet(lpnt, 'main', machine.config.teacher_ip)

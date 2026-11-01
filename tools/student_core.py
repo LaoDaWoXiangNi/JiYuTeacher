@@ -76,6 +76,7 @@ class StudentState:
     preview_enabled: bool = False
     preview_version: int = 0
     screen_broadcast: bool = False
+    student_demo: bool = False
     remote_view: bool = False
     remote_control: bool = False
     pending_submission: PendingSubmission | None = None
@@ -92,8 +93,8 @@ class StudentState:
             f'教师：{config.teacher_ip}（主 {config.main_port}，会话 {config.session_port_or_default}）',
             f'学生：{config.bind_ip}，频道 {config.channel}，组播 {config.multicast_group}',
             f'黑屏：{"是（仅提示）" if self.blackscreen else "否"}；举手：{"是" if self.hand_up else "否"}',
-            f'广播：{"是" if self.screen_broadcast else "否"}；观看：{"是" if self.remote_view else "否"}；'
-            f'远控请求：{"是（不执行）" if self.remote_control else "否"}',
+            f'广播：{"是" if self.screen_broadcast else "否"}；演示：{"是（仅提示）" if self.student_demo else "否"}；'
+            f'观看：{"是" if self.remote_view else "否"}；远控请求：{"是（不执行）" if self.remote_control else "否"}',
             f'文件提交：{self.submission_status}；{self.submission_detail}',
             f'待回复请求：{pending_text}',
             f'动作模式：{"受限白名单" if execute else "观察（全部仅记录）"}',
@@ -309,23 +310,43 @@ class StudentMachine:
         if msg_type == 8 and payload[12:16] == b'MCMD':
             self._handle_remote_control(payload)
             return
-        if msg_type == 0 and category in (0, 1):
-            if category == 1:
-                self.state.screen_broadcast = False
-            else:
-                self.state.remote_view = False
-            self.event('屏幕广播' if category == 1 else '远程观看', '停止')
+        if len(payload) >= 24 and payload[20:24] == struct.pack('<I', 4):
+            flags = struct.unpack_from('<I', payload, 24)[0] if len(payload) >= 28 else 0
+            self.state.student_demo = not bool(flags & 0x10000000)
+            self.send('ANNO', protocol.build_anno(
+                self.state.hand_up, student_demo=self.state.student_demo))
+            self.event('学生演示', '语音启动请求（仅提示，不连接或广播）'
+                       if self.state.student_demo else '语音控制停止；无屏幕媒体')
             return
-        if msg_type == 8 and len(payload) >= 12:
-            enabled = bool(category & 0x80000000)
-            if subtype == 1:
+        if msg_type == 0:
+            if not subtype and not (category & 0x0FFFFFFF):
+                self.state.remote_view = False
+                self.state.student_demo = False
+                self.event('媒体会话', '通用停止（远程观看/学生演示）')
+                return
+            feature = subtype or (category & 0x0FFFFFFF)
+            for feature_id, attribute, label in (
+                    (0, 'remote_view', '远程观看'), (1, 'screen_broadcast', '屏幕广播'),
+                    (4, 'student_demo', '学生演示'), (8, 'remote_view', '远程观看')):
+                if feature == feature_id:
+                    setattr(self.state, attribute, False)
+                    self.event(label, '停止')
+                    return
+            self.observe_only('未知媒体停止', f'feature={feature}')
+            return
+        if msg_type in (1, 4) or (msg_type == 8 and (subtype in (1, 4, 8) or not subtype)):
+            feature = subtype if msg_type == 8 and subtype else msg_type
+            enabled = not bool(category & 0x10000000)
+            if feature == 1:
                 self.state.screen_broadcast = enabled
                 self.event('屏幕广播', '开始请求（仅提示，无视频流）' if enabled else '停止')
-            elif subtype == 8:
+            elif feature == 4:
+                self.state.student_demo = enabled
+                self.send('ANNO', protocol.build_anno(self.state.hand_up, student_demo=enabled))
+                self.event('学生演示', '语音启动请求（仅提示，不连接或广播）' if enabled else '停止')
+            else:
                 self.state.remote_view = enabled
                 self.event('远程观看', '开始请求（仅提示，不开放 TCP 屏幕服务）' if enabled else '停止')
-            else:
-                self.observe_only('未知媒体功能', f'feature={subtype}, enabled={enabled}')
             return
         self.observe_only('未识别 MESS', f'type=0x{msg_type:X}, category=0x{category:X}, subtype={subtype}')
 
