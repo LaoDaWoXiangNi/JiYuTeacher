@@ -8,6 +8,8 @@
 import socket, struct, threading, time, random, sys, os, uuid, colorsys, ipaddress
 import logging, logging.handlers
 import queue
+import app_config
+import gui_events
 from classroom_store import ClassroomStore
 from PIL import Image, ImageOps
 import io
@@ -18,6 +20,8 @@ APP_DIR = os.path.dirname(sys.executable if getattr(sys, 'frozen', False)
 LOG_DIR = APP_DIR
 LOG_PATH = os.path.join(LOG_DIR, 'teacher_sim.log')
 REMOTE_VIEW_DIR = os.path.join(APP_DIR, 'teacher_remote_view')
+SUBMISSION_DIR = os.path.join(APP_DIR, 'submissions')
+SUBMISSION_MAX_BYTES = 64 * 1024 * 1024
 
 # 默认文件日志级别：INFO 已足够，DEBUG 太占空间。
 # 运行中可用 debug on/off 切换。
@@ -145,6 +149,14 @@ remote_state_lock = threading.RLock()
 last_status = {}  # (sip, key) -> 最近一条同类消息内容（重复降为 DEBUG，防止刷屏）
 running = True
 SELECTED_NETWORK = None
+SUBMISSION_PORT = 0
+submission_server = None
+submission_listen_port = None
+submission_lock = threading.RLock()
+submission_transactions = {}
+submission_active_uploads = {}
+submission_receipts = {}
+submission_receipt_sequence = 0
 
 classroom_store = ClassroomStore()
 try:
@@ -532,6 +544,9 @@ def get_channel_id():
 
 
 CHANNEL_ID = get_channel_id()
+SUBMISSION_PORT = app_config.load_submission_port()
+logger.info('文件接收配置：port=%d directory=%s（0 表示仅审批，不监听）',
+            SUBMISSION_PORT, SUBMISSION_DIR)
 
 
 def get_env_int(name, default, minimum=0, maximum=0xFFFF):
@@ -2812,14 +2827,317 @@ def handle_submit_request(d, sip):
     return True
 
 
+def _submission_detail(details, *names, default=''):
+    for name in names:
+        value = details.get(name)
+        if value is not None:
+            return value
+    return default
+
+
+def _submission_number(details, *names):
+    for name in names:
+        value = details.get(name)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            try:
+                return int(value, 0)
+            except ValueError:
+                pass
+    return 0
+
+
+def _submission_address(address):
+    if isinstance(address, (tuple, list)):
+        host = str(address[0]) if address else '-'
+        try:
+            port = int(address[1]) if len(address) > 1 else None
+        except (TypeError, ValueError):
+            port = None
+        return host, port
+    text = str(address or '-')
+    if text.count(':') == 1:
+        host, separator, port_text = text.rpartition(':')
+        if separator:
+            try:
+                return host, int(port_text)
+            except ValueError:
+                pass
+    return text, None
+
+
+def _safe_submission_component(value):
+    allowed = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-')
+    return ''.join(char if char in allowed else '_'
+                   for char in str(value))[:64] or 'unknown'
+
+
+def _submission_root():
+    return os.path.realpath(SUBMISSION_DIR)
+
+
+def submission_service_info():
+    """返回当前文件接收服务配置，供界面显示。"""
+    with submission_lock:
+        return {
+            'configured_port': SUBMISSION_PORT,
+            'listen_port': submission_listen_port,
+            'directory': _submission_root(),
+            'running': submission_server is not None,
+        }
+
+
+def get_submission_receipts(sip):
+    """返回指定学生最近完成的本地接收记录副本。"""
+    with submission_lock:
+        return list(submission_receipts.get(sip, ()))
+
+
+def _publish_submission_event(event):
+    try:
+        gui_events.submission_events.publish(event)
+    except Exception as error:
+        logger.warning('[FileSubmit][MiniMedia] GUI 事件桥接失败 kind=%s student=%s error=%s',
+                       event.get('kind'), event.get('student_ip'), error, exc_info=True)
+
+
+def _register_submission_upload(kind, student_ip, client_port, name, details):
+    normalized_name = (name or '').casefold()
+    identity = (student_ip, client_port or 0)
+    with submission_lock:
+        if kind == 'started':
+            conflict = None
+            if normalized_name:
+                for key in submission_active_uploads:
+                    if (key[2] == normalized_name
+                            and (key[0], key[1]) != identity):
+                        conflict = key
+                        break
+            if conflict is not None:
+                raise ValueError(f'同名文件正在接收，拒绝覆盖：{name}')
+            transaction = submission_transactions.get(student_ip)
+            submission_active_uploads[identity + (normalized_name,)] = {
+                'name': name,
+                'transaction': transaction,
+                'size': _submission_number(details, 'size', 'total_size'),
+            }
+            return transaction
+        if kind in ('completed', 'error'):
+            matching = [key for key in submission_active_uploads
+                        if key[0] == identity[0] and key[1] == identity[1]]
+            transaction = None
+            for key in matching:
+                active = submission_active_uploads.pop(key, None)
+                if active:
+                    transaction = active.get('transaction')
+            return transaction or submission_transactions.get(student_ip)
+        return submission_transactions.get(student_ip)
+
+
+def _next_submission_directory(student_ip, transaction, suffix):
+    if transaction and transaction.get('directory'):
+        return transaction['directory']
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    guid = _safe_submission_component(
+        (transaction or {}).get('transaction_guid', 'unassigned'))[:16]
+    return os.path.join(_submission_root(), _safe_submission_component(student_ip),
+                        f'{stamp}-{guid}-{suffix}')
+
+
+def _submission_unique_path(directory, name):
+    filename = os.path.basename(str(name).replace('\\', '/')) or 'received.bin'
+    if filename in ('', '.', '..'):
+        filename = 'received.bin'
+    stem, extension = os.path.splitext(filename)
+    candidate = os.path.join(directory, filename)
+    index = 2
+    while os.path.exists(candidate):
+        candidate = os.path.join(directory, f'{stem}_{index}{extension}')
+        index += 1
+    return candidate
+
+
+def _archive_submission_file(student_ip, name, source_path, transaction, byte_count, size):
+    global submission_receipt_sequence
+    final_path = source_path
+    if source_path:
+        try:
+            root = os.path.normcase(_submission_root())
+            absolute_source = os.path.normcase(os.path.realpath(source_path))
+            if os.path.commonpath((root, absolute_source)) != root:
+                raise ValueError(f'接收文件不在 submissions 根目录：{source_path}')
+            if os.path.isfile(source_path):
+                with submission_lock:
+                    submission_receipt_sequence += 1
+                    sequence = submission_receipt_sequence
+                directory = _next_submission_directory(
+                    student_ip, transaction, f'{sequence:06d}')
+                os.makedirs(directory, exist_ok=True)
+                target = _submission_unique_path(directory, name or os.path.basename(source_path))
+                os.replace(source_path, target)
+                final_path = target
+        except Exception as error:
+            logger.error('[FileSubmit][MiniMedia] 接收文件归档失败 student=%s file=%s '
+                         'source=%s error=%s', student_ip, name, source_path, error,
+                         exc_info=True)
+            return final_path, str(error)
+    with submission_lock:
+        submission_receipt_sequence += 1
+        sequence = submission_receipt_sequence
+        receipt = {
+            'sequence': sequence,
+            'student_ip': student_ip,
+            'file': name,
+            'path': final_path,
+            'bytes': byte_count,
+            'size': size,
+            'transaction_guid': (transaction or {}).get('transaction_guid', ''),
+        }
+        entries = submission_receipts.setdefault(student_ip, [])
+        entries.append(receipt)
+        del entries[:-20]
+    return final_path, None
+
+
+def _submission_event(kind, address, details):
+    """把 MiniMediaServer 的后台线程事件写入日志并桥接到 GUI 线程。"""
+    event_kind = str(kind)
+    try:
+        event_details = dict(details or {})
+    except (TypeError, ValueError):
+        event_details = {'raw': repr(details)}
+    student_ip, client_port = _submission_address(address)
+    source_path = str(_submission_detail(event_details, 'path', 'target', 'destination'))
+    name = str(_submission_detail(event_details, 'name', 'file', 'filename', 'file_name'))
+    if not name and source_path:
+        name = os.path.basename(source_path.replace('\\', '/'))
+    size = _submission_number(event_details, 'size', 'total_size', 'bytes_total', 'total')
+    byte_count = _submission_number(event_details, 'received', 'bytes', 'byte_count',
+                                    'bytes_received')
+    if event_kind in ('progress', 'completed') and not byte_count:
+        byte_count = size
+    error = str(_submission_detail(event_details, 'error', 'message', default=''))
+    try:
+        transaction = _register_submission_upload(
+            event_kind, student_ip, client_port, name, event_details)
+    except ValueError as conflict:
+        logger.error('[FileSubmit][MiniMedia] kind=started student=%s address=%s file=%s '
+                     'bytes=%d/%d path=%s error=%s',
+                     student_ip, address, name or '-', byte_count, size,
+                     source_path or '-', conflict)
+        _publish_submission_event({
+            'kind': 'error', 'student_ip': student_ip, 'address': str(address),
+            'file': name or '-', 'path': source_path or '-', 'bytes': byte_count,
+            'size': size, 'error': str(conflict), 'transaction_guid': '',
+        })
+        raise
+    final_path = source_path
+    if event_kind == 'completed':
+        final_path, archive_error = _archive_submission_file(
+            student_ip, name, source_path, transaction, byte_count, size)
+        if archive_error:
+            event_kind = 'error'
+            error = error or archive_error
+    event = {
+        'kind': event_kind,
+        'student_ip': student_ip,
+        'address': str(address),
+        'file': name or '-',
+        'path': final_path or '-',
+        'bytes': byte_count,
+        'size': size,
+        'error': error or '-',
+        'transaction_guid': (transaction or {}).get('transaction_guid', ''),
+    }
+    if event_kind == 'error' or error:
+        logger.error('[FileSubmit][MiniMedia] kind=%s student=%s address=%s file=%s '
+                     'bytes=%d/%d path=%s error=%s',
+                     event_kind, student_ip, address, event['file'], byte_count, size,
+                     event['path'], event['error'])
+    else:
+        logger.info('[FileSubmit][MiniMedia] kind=%s student=%s address=%s file=%s '
+                    'bytes=%d/%d path=%s error=%s',
+                    event_kind, student_ip, address, event['file'], byte_count, size,
+                    event['path'], event['error'])
+    _publish_submission_event(event)
+
+
+def _ensure_submission_server():
+    """按配置端口惰性启动唯一的 MiniMediaServer；0 表示不监听。"""
+    global submission_server, submission_listen_port
+    if not SUBMISSION_PORT:
+        return 0
+    with submission_lock:
+        if submission_server is not None:
+            if submission_listen_port != SUBMISSION_PORT:
+                raise RuntimeError(
+                    f'文件接收服务已在端口 {submission_listen_port} 运行；'
+                    f'端口 {SUBMISSION_PORT} 需重启教师端后生效')
+            return submission_listen_port
+        from minimedia_server import MiniMediaServer
+        directory = _submission_root()
+        os.makedirs(directory, exist_ok=True)
+        server = MiniMediaServer(ip, SUBMISSION_PORT, directory,
+                                 event_handler=_submission_event,
+                                 maximum=SUBMISSION_MAX_BYTES)
+        try:
+            actual_port = server.start()
+        except Exception:
+            try:
+                server.close()
+            except Exception:
+                pass
+            logger.exception('[FileSubmit][MiniMedia] 启动失败 bind=%s:%d directory=%s；'
+                             '保留 pending', ip, SUBMISSION_PORT, directory)
+            raise
+        submission_server = server
+        submission_listen_port = int(actual_port)
+        logger.info('[FileSubmit][MiniMedia] 单服务已启动 bind=%s:%d directory=%s '
+                    'maximum=%d；仅用于独立模拟工具联调',
+                    ip, submission_listen_port, directory, SUBMISSION_MAX_BYTES)
+        return submission_listen_port
+
+
+def _prepare_submission_transaction(sip, request):
+    global submission_receipt_sequence
+    with submission_lock:
+        submission_receipt_sequence += 1
+        sequence = submission_receipt_sequence
+        guid = _safe_submission_component(request.get('transaction_guid', 'unknown'))
+        directory = os.path.join(
+            _submission_root(), _safe_submission_component(sip),
+            f'{time.strftime("%Y%m%d-%H%M%S")}-{guid[:12]}-{sequence:06d}')
+        os.makedirs(directory, exist_ok=True)
+        submission_transactions[sip] = {
+            'student_ip': sip,
+            'transaction_guid': request.get('transaction_guid', ''),
+            'directory': directory,
+            'created_at': time.time(),
+        }
+        return directory
+
+
 def respond_submit_request(sip, accept):
-    """仅对待审批 QRMS 发送 RRMS；发送成功后才更新审批状态。"""
+    """对待审批 QRMS 启动接收服务（按需）并发送 RRMS；成功后才更新状态。"""
     request = students.get(sip, {}).get('submit_request')
     if request is None:
         raise ValueError(f'{sip} 没有文件提交请求')
     if request.get('status') != 'pending':
         raise ValueError(f'{sip} 的文件提交请求已审批，不能重复操作')
     packet = build_rrms(request, accept)
+    listen_port = 0
+    transaction_directory = None
+    if accept and SUBMISSION_PORT:
+        try:
+            listen_port = _ensure_submission_server()
+            transaction_directory = _prepare_submission_transaction(sip, request)
+        except Exception as error:
+            logger.exception('[FileSubmit] 接收服务未就绪 sip=%s guid=%s port=%d；保留 pending',
+                             sip, request['transaction_guid'], SUBMISSION_PORT)
+            raise RuntimeError(f'文件接收服务启动失败，RRMS 未发送：{error}') from error
     try:
         sock.sendto(packet, (sip, PORT))
     except Exception:
@@ -2827,11 +3145,23 @@ def respond_submit_request(sip, accept):
                          sip, request['transaction_guid'], bool(accept))
         raise
     request['status'] = 'approved' if accept else 'rejected'
-    logger.info('[FileSubmit] RRMS -> %s:%d guid=%s status=%s student_id=%d '
-                'accept=%d arg2=1 arg3=1 quota=%d max_files=%d；仅审批，未传输文件',
-                sip, PORT, request['transaction_guid'], request['status'],
-                request['student_id'], 1 if accept else 0,
-                request['total_size'], request['file_count'])
+    request['submission_port'] = listen_port if accept else 0
+    request['submission_directory'] = transaction_directory if accept else None
+    if listen_port:
+        logger.info('[FileSubmit] RRMS -> %s:%d guid=%s status=%s student_id=%d '
+                    'accept=%d arg2=1 arg3=1 quota=%d max_files=%d；'
+                    '接收服务=%s:%d directory=%s（RRMS 本身不含文件内容）',
+                    sip, PORT, request['transaction_guid'], request['status'],
+                    request['student_id'], 1 if accept else 0,
+                    request['total_size'], request['file_count'],
+                    ip, listen_port, transaction_directory)
+    else:
+        logger.info('[FileSubmit] RRMS -> %s:%d guid=%s status=%s student_id=%d '
+                    'accept=%d arg2=1 arg3=1 quota=%d max_files=%d；'
+                    '未配置文件接收端口或已拒绝，仅完成审批',
+                    sip, PORT, request['transaction_guid'], request['status'],
+                    request['student_id'], 1 if accept else 0,
+                    request['total_size'], request['file_count'])
     return request
 
 
@@ -3475,8 +3805,19 @@ def start_background_threads():
 
 
 def shutdown():
-    global running, classroom_shutdown
+    global running, classroom_shutdown, submission_server, submission_listen_port
     running = False
+    with submission_lock:
+        server, submission_server = submission_server, None
+        closed_port, submission_listen_port = submission_listen_port, None
+    if server is not None:
+        try:
+            server.close()
+            logger.info('[FileSubmit][MiniMedia] 接收服务已关闭 port=%s directory=%s',
+                        closed_port, SUBMISSION_DIR)
+        except Exception as error:
+            logger.warning('[FileSubmit][MiniMedia] 关闭接收服务失败 port=%s error=%s',
+                           closed_port, error, exc_info=True)
     with classroom_lock:
         if not classroom_shutdown:
             classroom_shutdown = True

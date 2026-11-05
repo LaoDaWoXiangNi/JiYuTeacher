@@ -21,6 +21,7 @@ import app_config
 import gui_events
 
 CHANNEL_FROM_ENV = 'TEACHER_CHANNEL' in os.environ
+SUBMISSION_PORT_FROM_ENV = app_config.has_explicit_submission_port()
 if not CHANNEL_FROM_ENV:
     os.environ['TEACHER_CHANNEL'] = str(app_config.load_channel())
 
@@ -162,6 +163,7 @@ class UiBridge(QObject):
     log = pyqtSignal(str, int)
     chat = pyqtSignal(str, str)
     classroom = pyqtSignal(object)
+    submission = pyqtSignal(object)
 
 
 class CardScrollArea(QScrollArea):
@@ -315,11 +317,11 @@ class TextCommandDialog(QDialog):
 class ChannelSettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle('频道设置')
-        self.setMinimumWidth(440)
+        self.setWindowTitle('频道与接收设置')
+        self.setMinimumWidth(480)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(26, 24, 26, 24)
-        heading = QLabel('频道设置')
+        heading = QLabel('频道与接收设置')
         heading.setObjectName('dialogTitle')
         layout.addWidget(heading)
         form = QFormLayout()
@@ -328,13 +330,32 @@ class ChannelSettingsDialog(QDialog):
         self.channel_input.setValue(app_config.load_channel())
         self.channel_input.setAccessibleName('下次启动使用的频道')
         form.addRow('频道（1–32）', self.channel_input)
+        self.submission_port_input = QSpinBox()
+        self.submission_port_input.setRange(0, 65535)
+        self.submission_port_input.setValue(app_config.load_submission_port())
+        self.submission_port_input.setAccessibleName('下次启动使用的文件接收端口')
+        form.addRow('文件接收端口（0 禁用）', self.submission_port_input)
         layout.addLayout(form)
-        current = QLabel(f'当前运行频道：{core.CHANNEL_ID}（保存后重启生效）')
+        service = core.submission_service_info()
+        current = QLabel(
+            f'当前运行频道：{core.CHANNEL_ID}；当前文件接收端口：'
+            f'{service["configured_port"]}（服务'
+            f'{"已启动" if service["running"] else "尚未启动"}）。保存后重启教师端生效。')
         current.setObjectName('muted')
         current.setWordWrap(True)
         layout.addWidget(current)
+        hint = QLabel('端口 1–65535 只作为本项目独立模拟工具的本地监听端口；'
+                      '尚未确认官方学生端的默认文件提交端口。0 仅发送 RRMS 审批。')
+        hint.setObjectName('muted')
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        env_notes = []
         if CHANNEL_FROM_ENV:
-            env_note = QLabel('检测到 TEACHER_CHANNEL 环境变量；其值优先于此处保存的配置。')
+            env_notes.append('检测到 TEACHER_CHANNEL 环境变量；其值优先于此处保存的配置。')
+        if SUBMISSION_PORT_FROM_ENV:
+            env_notes.append('检测到 TEACHER_SUBMISSION_PORT 环境变量；其值优先于配置文件和本次保存值。')
+        if env_notes:
+            env_note = QLabel('\n'.join(env_notes))
             env_note.setObjectName('warning')
             env_note.setWordWrap(True)
             layout.addWidget(env_note)
@@ -355,16 +376,19 @@ class MainWindow(QMainWindow):
         self.cards = {}
         self.current_ip = None
         self.shutting_down = False
+        self.submission_events_by_ip = {}
         self.bridge = UiBridge()
         self.bridge.preview.connect(self.set_preview)
         self.bridge.log.connect(self.append_log)
         self.bridge.chat.connect(self.append_chat)
         self.bridge.classroom.connect(self.classroom_changed)
+        self.bridge.submission.connect(self.submission_changed)
         core.bind_classroom_observer(self.bridge.classroom.emit)
         self.event_callbacks = (
             (gui_events.preview_events, self.bridge.preview.emit),
             (gui_events.log_events, self.bridge.log.emit),
             (gui_events.chat_events, self.bridge.chat.emit),
+            (gui_events.submission_events, self.bridge.submission.emit),
         )
         for channel, callback in self.event_callbacks:
             channel.connect(callback)
@@ -433,9 +457,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(channel)
         settings = QPushButton(icon('settings', '#8290a4', 18), '')
         settings.setObjectName('channelSettings')
-        settings.setToolTip('频道设置（重启生效）')
-        settings.setAccessibleName('频道设置')
-        settings.setAccessibleDescription('配置下次启动使用的教师端频道，范围 1 到 32')
+        settings.setToolTip('频道与文件接收设置（重启生效）')
+        settings.setAccessibleName('频道与接收设置')
+        settings.setAccessibleDescription(
+            '配置下次启动使用的教师端频道和文件接收端口，端口范围 0 到 65535')
         settings.setFixedSize(56, 38)
         settings.setCursor(Qt.CursorShape.PointingHandCursor)
         settings.clicked.connect(self.channel_settings)
@@ -595,6 +620,11 @@ class MainWindow(QMainWindow):
         submit_layout.addWidget(self.reject_submit_button)
         device_layout.addWidget(self.submit_controls)
         self.submit_controls.hide()
+        self.submission_status_label = QLabel('')
+        self.submission_status_label.setObjectName('muted')
+        self.submission_status_label.setWordWrap(True)
+        self.submission_status_label.hide()
+        device_layout.addWidget(self.submission_status_label)
         self.device_tabs.addTab(device_page, '设备')
         self.process_table = self.id_name_table(('PID', '进程名称'))
         self.device_tabs.addTab(self.process_table, '进程')
@@ -1101,7 +1131,9 @@ class MainWindow(QMainWindow):
         self.view_stat.setObjectName('monoMuted')
         layout.addWidget(self.view_stat)
         layout.addStretch()
-        protocol = QLabel(f'JIYU V6.0   ·   UDP {core.PORT} / {core.SPORT}   ·   TCP 4806')
+        protocol = QLabel(
+            f'JIYU V6.0   ·   UDP {core.PORT} / {core.SPORT}   ·   TCP 4806   ·   '
+            f'FILE {core.SUBMISSION_PORT or "OFF"}')
         protocol.setObjectName('monoMuted')
         layout.addWidget(protocol)
         return bar
@@ -1121,20 +1153,33 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         channel = dialog.channel_input.value()
+        submission_port = dialog.submission_port_input.value()
         path = app_config.config_path()
         try:
-            app_config.save_channel(channel, path)
+            app_config.save_settings(channel, submission_port, path)
         except OSError as error:
-            core.logger.error('[UI] 保存频道配置失败 path=%s error=%s', path, error)
-            QMessageBox.critical(self, '保存失败', f'无法写入频道配置：\n{error}')
+            core.logger.error('[UI] 保存频道/文件接收端口失败 path=%s error=%s',
+                              path, error)
+            QMessageBox.critical(self, '保存失败', f'无法写入配置：\n{error}')
             return
-        core.logger.info('[UI] 频道设置已保存：下次启动频道=%d，当前运行频道=%d，path=%s',
-                         channel, core.CHANNEL_ID, path)
-        message = (f'已将下次启动频道保存为 {channel}。\n'
-                   f'当前运行频道仍为 {core.CHANNEL_ID}，重启教师端后生效。')
+        core.logger.info('[UI] 设置已保存：下次启动频道=%d，文件接收端口=%d；'
+                         '当前频道=%d，当前端口=%d，path=%s',
+                         channel, submission_port, core.CHANNEL_ID,
+                         core.SUBMISSION_PORT, path)
+        message = (f'已将下次启动频道保存为 {channel}，文件接收端口保存为 {submission_port}。\n'
+                   f'当前运行频道仍为 {core.CHANNEL_ID}，文件接收端口仍为 '
+                   f'{core.SUBMISSION_PORT}；重启教师端后生效。')
+        if submission_port == 0:
+            message += '\n\n端口 0 表示禁用文件接收，RRMS 接受仍只完成审批。'
+        else:
+            message += ('\n\n该端口仅用于本项目独立模拟工具联调，未确认官方学生端端口；'
+                        '重启后首次接受文件提交时才会惰性启动监听。')
         if CHANNEL_FROM_ENV:
             message += '\n\n当前存在 TEACHER_CHANNEL 环境变量，启动时将优先使用该变量。'
-        QMessageBox.information(self, '频道设置已保存', message)
+        if SUBMISSION_PORT_FROM_ENV:
+            message += ('\n当前存在 TEACHER_SUBMISSION_PORT 环境变量，启动时将优先使用该变量；'
+                        '配置文件中的端口不会覆盖它。')
+        QMessageBox.information(self, '设置已保存', message)
 
     def refresh_students(self):
         current = set(core.students)
@@ -1243,14 +1288,30 @@ class MainWindow(QMainWindow):
         if submit:
             state_text = {
                 'pending': '待审批（可接受或拒绝）',
-                'approved': '已接受（仅 RRMS 审批完成，MiniMedia 未实现，未上传文件）',
-                'rejected': '已拒绝（仅 RRMS 审批完成，未上传文件）',
+                'approved': '已接受（RRMS 审批完成）',
+                'rejected': '已拒绝（RRMS 审批完成）',
             }.get(submit_status, submit_status)
             status += (f'\n文件提交：{submit["file_count"]} 个文件，{submit["total_size"]} 字节\n'
                        f'目录：{submit["directory"]}\n'
                        f'列表：{submit["file_list"]}\n'
                        f'事务：{submit["transaction_guid"]}\n'
                        f'审批状态：{state_text}')
+            if submit.get('submission_port'):
+                status += (f'\n接收服务：{core.ip}:{submit["submission_port"]}\n'
+                           f'事务接收目录：{submit.get("submission_directory")}'
+                           '\n（仅对本项目独立模拟工具有效，未验证原版学生端）')
+        service = core.submission_service_info()
+        if service['configured_port']:
+            status += (f'\n文件接收端口：{service["configured_port"]}'
+                       f'（{"已监听" if service["running"] else "接受时启动"}）'
+                       f'  根目录：{service["directory"]}')
+        else:
+            status += '\n文件接收端口：0（禁用）；RRMS 接受仅完成审批，不接收文件内容'
+        receipts = core.get_submission_receipts(self.current_ip) if self.current_ip else []
+        if receipts:
+            last = receipts[-1]
+            status += (f'\n最近接收完成：{last["file"]}，{last["bytes"]} 字节\n'
+                       f'接收路径：{last["path"]}')
         self.info_text.setPlainText(('\n'.join(
             f'{label}：{self.current_ip if key is None else info.get(key, "待上报")}'
             for label, key in labels) + '\n' + status) if self.current_ip else '请先从左侧选择终端。')
@@ -1260,8 +1321,34 @@ class MainWindow(QMainWindow):
         self.reject_submit_button.setEnabled(pending)
         self.fill_id_name_table(self.process_table, student.get('processes', []), False)
         self.fill_id_name_table(self.window_table, student.get('windows', []), True)
+        self.refresh_submission_event()
         if self.current_ip in self.cards:
             self.cards[self.current_ip].update_student(student)
+
+    def submission_changed(self, event):
+        if not isinstance(event, dict):
+            return
+        student_ip = event.get('student_ip', '-')
+        summary = (f"事件：{event.get('kind', '-')}\n"
+                   f"文件：{event.get('file', '-')}\n"
+                   f"字节：{event.get('bytes', 0)} / {event.get('size', 0)}\n"
+                   f"路径：{event.get('path', '-')}\n"
+                   f"错误：{event.get('error', '-')}")
+        self.submission_events_by_ip[student_ip] = summary
+        if hasattr(self, 'chat_history'):
+            self.chat_history.appendPlainText(
+                f'[{time.strftime("%H:%M:%S")}] 文件接收 · {student_ip}\n{summary}')
+            scrollbar = self.chat_history.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+        if student_ip == self.current_ip:
+            self.refresh_submission_event()
+
+    def refresh_submission_event(self):
+        if not hasattr(self, 'submission_status_label'):
+            return
+        summary = self.submission_events_by_ip.get(self.current_ip)
+        self.submission_status_label.setText(f'最新文件接收事件\n{summary}' if summary else '')
+        self.submission_status_label.setVisible(bool(summary))
 
     def review_submit_request(self, accept):
         ip = self.current_ip
@@ -1274,12 +1361,27 @@ class MainWindow(QMainWindow):
             core.logger.warning('[UI] 文件提交审批取消 target=%s guid=%s reason=重复审批',
                                 ip, request['transaction_guid'])
             self.update_selected_details()
+            QMessageBox.information(
+                self, '无法重复审批',
+                f'{ip} 的文件提交请求已处理，状态为 {request.get("status")}，未重复发送 RRMS。')
             return
         action = '接受' if accept else '拒绝'
-        detail = ('仅发送 RRMS 接受审批，不会上传或接收文件；MiniMedia 尚未实现。'
-                  if accept else '仅发送 RRMS 拒绝审批，不会上传或接收文件。')
-        core.logger.info('[UI] 文件提交审批确认 target=%s guid=%s action=%s',
-                         ip, request['transaction_guid'], action)
+        service = core.submission_service_info()
+        if accept and service['configured_port']:
+            detail = (f'RRMS 接受前会启动或复用 {core.ip}:{service["configured_port"]} 的'
+                      f'本地接收服务，文件保存到 {service["directory"]} 下的独立事务目录。\n'
+                      '只有使用本项目独立模拟工具向该端口发送 MiniMedia 帧时才会接收真实内容；'
+                      'RRMS 本身不含文件内容。\n'
+                      '官方学生端端口与兼容性尚未确认，本次操作不代表原版实机兼容。')
+        elif accept:
+            detail = ('当前文件接收端口为 0（禁用）：本次只发送 RRMS 接受审批，'
+                      '不启动接收服务，也不会接收真实文件内容。\n'
+                      '可在“频道与接收设置”中填写 1–65535 并重启教师端后再启用接收。')
+        else:
+            detail = '仅发送 RRMS 拒绝审批，不会启动接收服务，也不会接收文件内容。'
+        core.logger.info('[UI] 文件提交审批确认 target=%s guid=%s action=%s port=%d',
+                         ip, request['transaction_guid'], action,
+                         service['configured_port'])
         if not self.confirm(f'{action}文件提交',
                             f'终端：{ip}\n文件数：{request["file_count"]}\n\n{detail}'):
             core.logger.info('[UI] 文件提交审批已取消 target=%s action=%s', ip, action)
@@ -1290,10 +1392,16 @@ class MainWindow(QMainWindow):
             return
         message = (f'已向 {ip} 发送 RRMS {action}审批。当前状态：{result["status"]}。\n\n'
                    '这只是审批结果，不是文件上传或传输完成。')
-        if accept:
-            message += '\nMiniMedia 尚未实现，本次没有传输任何文件。'
-        core.logger.info('[UI] 文件提交审批完成 target=%s guid=%s status=%s',
-                         ip, result['transaction_guid'], result['status'])
+        if accept and result.get('submission_port'):
+            message += (f'\n接收服务：{core.ip}:{result["submission_port"]}；'
+                        f'事务目录：{result.get("submission_directory")}。\n'
+                        '仅独立模拟工具按该端口上传后，消息中心和设备详情才会显示'
+                        '接收路径与字节数；不代表已与原版学生端实机兼容。')
+        elif accept:
+            message += '\n未配置接收端口，本次没有传输或接收任何文件。'
+        core.logger.info('[UI] 文件提交审批完成 target=%s guid=%s status=%s port=%d',
+                         ip, result['transaction_guid'], result['status'],
+                         result.get('submission_port', 0))
         QMessageBox.information(self, 'RRMS 审批已发送', message)
 
     def fill_id_name_table(self, table, rows, hexadecimal):

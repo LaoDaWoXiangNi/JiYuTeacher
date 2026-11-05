@@ -71,6 +71,10 @@ def build_parser():
                         help='覆盖频道会话端口；默认按频道计算')
     parser.add_argument('--execute', action='store_true',
                         help='仅允许 HTTP/HTTPS 与 Windows 白名单程序；危险动作仍不执行')
+    parser.add_argument('--submission-port', type=int, default=0,
+                        help='教师 MiniMedia 上传 TCP 端口；0 表示禁用上传（默认 0）')
+    parser.add_argument('--upload-on-approve', action='store_true',
+                        help='RRMS 严格批准后逐个上传所选文件；需同时指定 --submission-port')
     parser.add_argument('--cli', action='store_true', help='强制命令行界面')
     parser.add_argument('--gui', action='store_true', help='强制图形界面（需要 PyQt6）')
     parser.add_argument('--self-test', action='store_true', help='无网络协议/状态自检后退出')
@@ -89,6 +93,10 @@ def safe_user_name():
         return 'student'
 
 
+def status_text(machine):
+    return '\n'.join(machine.state.status_lines(machine.config, machine.config.execute))
+
+
 def make_config(args):
     if not args.teacher_ip:
         raise ValueError('请指定 --teacher-ip；自检可使用 --self-test，不需要网络')
@@ -98,13 +106,15 @@ def make_config(args):
     except ipaddress.AddressValueError as exc:
         raise ValueError(f'IPv4 地址无效：{exc}') from exc
     return StudentConfig(teacher_ip, bind_ip, args.channel, args.computer_name,
-                         args.user_name, args.main_port, args.session_port, args.execute)
+                         args.user_name, args.main_port, args.session_port, args.execute,
+                         upload_port=args.submission_port,
+                         upload_on_approve=args.upload_on_approve)
 
 
 CLI_HELP = '''命令：
   chat <文本>             发送 MESS type=0x800 聊天
   handup / handdown       举手 / 取消举手（ANNO 72 字节）
-  submit <文件> [...]     发送 QRMS 并等待 RRMS；不上传内容；路径含空格请加引号
+  submit <文件> [...]     发送 QRMS 并等待 RRMS；仅在启用上传且严格批准后上传所选文件
   info [0|1|2]           主动上报全部/窗口/进程信息
   status                 显示当前模拟状态
   login                  立即发送 LOGI（后台也会周期保活）
@@ -139,7 +149,7 @@ def run_cli(config):
                 if command == 'help':
                     print(CLI_HELP)
                 elif command == 'status':
-                    print('\n'.join(machine.state.status_lines(config, config.execute)))
+                    print(status_text(machine))
                 elif command == 'login':
                     machine.login()
                 elif command == 'chat':
@@ -191,6 +201,7 @@ def run_gui(config):
     status = QLabel()
     status.setTextInteractionFlags(status.textInteractionFlags())
     status.setWordWrap(True)
+    status.setText(status_text(machine))
     layout.addWidget(status)
     timeline = QPlainTextEdit()
     timeline.setReadOnly(True)
@@ -216,7 +227,7 @@ def run_gui(config):
     def record(kind, text):
         timeline.appendPlainText(f'{time.strftime("%H:%M:%S")} [{kind}] {text}')
         LOGGER.info('[UI/%s] %s', kind, text)
-        status.setText('\n'.join(machine.state.status_lines(config, config.execute)))
+        status.setText(status_text(machine))
 
     def perform(action):
         try:
@@ -235,7 +246,9 @@ def run_gui(config):
         hand_button.setText('取消举手' if machine.state.hand_up else '举手')
 
     def submit():
-        paths, _ = QFileDialog.getOpenFileNames(window, '选择要提交的文件（只发送请求）')
+        caption = ('选择要提交的文件（严格批准后上传）' if config.upload_enabled
+                   else '选择要提交的文件（只发送请求）')
+        paths, _ = QFileDialog.getOpenFileNames(window, caption)
         if paths:
             perform(lambda: machine.submit_files(paths))
 

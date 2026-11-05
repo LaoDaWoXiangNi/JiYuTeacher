@@ -1,6 +1,7 @@
 """内置无网络自检，不创建测试框架文件，也不导入教师端。"""
 from __future__ import annotations
 
+import inspect
 import struct
 import tempfile
 import traceback
@@ -26,15 +27,24 @@ FACTS = {
 }
 
 
-def make_machine(execute=False):
+def make_machine(execute=False, **config_kwargs):
     sent = []
     events = []
     config = StudentConfig('192.0.2.10', '192.0.2.20', 1,
-                           '自检计算机', '自检用户', execute=execute)
+                           '自检计算机', '自检用户', execute=execute, **config_kwargs)
     machine = StudentMachine(config, lambda kind, data, via: sent.append((kind, data, via)),
                              lambda kind, text: events.append((kind, text)), FACTS,
                              [(0x1234, '窗口一')], [(321, 'demo.exe')])
     return machine, sent, events
+
+
+def approve(machine, guid=None):
+    if guid is None:
+        pending = machine.state.pending_submission
+        assert pending is not None
+        guid = uuid.UUID(bytes_le=bytes.fromhex(pending.transaction_guid))
+    response = protocol.build_submit_response(42, 1, 1, 1, transaction_guid=guid)
+    machine.handle_packet(response, 'main', machine.config.teacher_ip)
 
 
 def teacher_mess(student_ip, msg_type, category=0, rest=b''):
@@ -155,6 +165,8 @@ def run_self_test() -> int:
             pending = machine.state.pending_submission
             assert pending is not None
             assert pending.student_id == 42 and pending.file_count == 1 and pending.total_size == 5
+            assert pending.paths == (str(first.resolve()),)
+            assert Path(pending.paths[0]).is_absolute()
             assert machine.state.submission_status == 'pending'
             assert sent[-1][0:3:2] == ('QRMS', 'main')
             request_guid = uuid.UUID(bytes_le=bytes.fromhex(pending.transaction_guid))
@@ -165,7 +177,7 @@ def run_self_test() -> int:
             machine.handle_packet(approved, 'main', machine.config.teacher_ip)
             assert machine.state.submission_status == 'approved'
             assert machine.state.pending_submission is None
-            assert machine.state.submission_detail == '教师已接受，MiniMedia 上传未实现；不会发送文件内容'
+            assert machine.state.submission_detail == '教师已接受；上传模式未启用，不会发送文件内容'
             assert len(sent) == 1
             machine.handle_packet(approved, 'main', machine.config.teacher_ip)
             assert len(sent) == 1
@@ -345,14 +357,256 @@ def run_self_test() -> int:
             close.assert_called_once()
             assert client.stop_event is not old_stop and not client.stop_event.is_set()
 
+    def submission_paths_and_directory_rejected():
+        machine, _, _ = make_machine()
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / 'first.txt'
+            second = Path(directory) / 'second.txt'
+            first.write_bytes(b'first')
+            second.write_bytes(b'second!')
+            with mock.patch.object(student_core, 'upload_file') as upload:
+                machine.submit_files([str(first), str(second)])
+                pending = machine.state.pending_submission
+                assert tuple(pending.paths) == (str(first.resolve()), str(second.resolve()))
+                assert all(Path(path).is_absolute() for path in pending.paths)
+                assert pending.file_count == 2 and pending.total_size == 12
+                approve(machine)
+                assert machine.state.submission_status == 'approved'
+                assert machine.state.submission_detail == '教师已接受；上传模式未启用，不会发送文件内容'
+                upload.assert_not_called()
+            try:
+                machine.submit_files([directory])
+            except ValueError as exc:
+                assert '不是可提交的文件' in str(exc)
+            else:
+                raise AssertionError('目录被当作可提交文件')
+            assert machine.state.pending_submission is None
+
+    def upload_gates():
+        for port, flag in ((0, False), (12345, False), (0, True)):
+            machine, _, _ = make_machine(upload_port=port, upload_on_approve=flag)
+            assert not machine.config.upload_enabled
+            with tempfile.TemporaryDirectory() as directory:
+                target = Path(directory) / 'a.txt'
+                target.write_bytes(b'a')
+                with mock.patch.object(student_core, 'upload_file') as upload:
+                    machine.submit_files([str(target)])
+                    approve(machine)
+                    assert machine.state.submission_status == 'approved'
+                    upload.assert_not_called()
+            status = '\n'.join(machine.state.status_lines(machine.config, False))
+            assert '仅审批，不建立上传 TCP' in status
+
+    def upload_on_approve_two_files():
+        machine, sent, events = make_machine(upload_port=12345, upload_on_approve=True)
+        assert machine.config.upload_enabled
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / 'first.txt'
+            second = Path(directory) / 'second.txt'
+            first.write_bytes(b'first')
+            second.write_bytes(b'second!')
+            with mock.patch.object(student_core, 'upload_file',
+                                   side_effect=[5, 7]) as upload, \
+                    mock.patch.object(student_core.subprocess, 'Popen') as popen, \
+                    mock.patch.object(student_core.webbrowser, 'open') as browser:
+                machine.submit_files([str(first), str(second)])
+                guid = uuid.UUID(bytes_le=bytes.fromhex(
+                    machine.state.pending_submission.transaction_guid))
+                approve(machine, guid)
+                assert machine.state.submission_status == 'uploaded'
+                assert machine.state.pending_submission is None
+                assert upload.call_args_list == [
+                    mock.call('192.0.2.10', 12345, str(first.resolve())),
+                    mock.call('192.0.2.10', 12345, str(second.resolve())),
+                ]
+                detail = machine.state.submission_detail
+                assert '2/2' in detail and '12 字节' in detail
+                assert str(first.resolve()) in detail and str(second.resolve()) in detail
+                assert any('已上传' in text and first.name in text for _, text in events)
+                assert any('已上传' in text and second.name in text for _, text in events)
+                popen.assert_not_called()
+                browser.assert_not_called()
+                machine.handle_packet(
+                    protocol.build_submit_response(42, 1, 1, 1, transaction_guid=guid),
+                    'main', machine.config.teacher_ip)
+                assert upload.call_count == 2
+                assert machine.state.submission_status == 'uploaded'
+                assert any('重复 RRMS' in text for _, text in events)
+            assert len(sent) == 1 and sent[0][0] == 'QRMS'
+            status = '\n'.join(machine.state.status_lines(machine.config, False))
+            assert '上传模式：启用' in status and '192.0.2.10:12345' in status
+
+    def guid_mismatch_no_upload():
+        machine, _, events = make_machine(upload_port=12345, upload_on_approve=True)
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'a.txt'
+            target.write_bytes(b'a')
+            with mock.patch.object(student_core, 'upload_file') as upload:
+                machine.submit_files([str(target)])
+                guid = uuid.UUID(bytes_le=bytes.fromhex(
+                    machine.state.pending_submission.transaction_guid))
+                wrong = protocol.build_submit_response(42, 1, 1, 1,
+                                                       transaction_guid=uuid.uuid4())
+                machine.handle_packet(wrong, 'main', machine.config.teacher_ip)
+                assert machine.state.submission_status == 'pending'
+                assert any('GUID 不匹配' in text for _, text in events)
+                upload.assert_not_called()
+                machine.handle_packet(
+                    protocol.build_submit_response(42, 1, 1, 1, transaction_guid=guid),
+                    'main', '192.0.2.99')
+                machine.handle_packet(
+                    protocol.build_submit_response(43, 1, 1, 1, transaction_guid=guid),
+                    'main', machine.config.teacher_ip)
+                machine.handle_packet(
+                    protocol.build_submit_response(42, 1, 1, 1,
+                                                   transaction_guid=guid)[:-1],
+                    'main', machine.config.teacher_ip)
+                assert machine.state.submission_status == 'pending'
+                assert machine.state.pending_submission is not None
+                upload.assert_not_called()
+                approve(machine, guid)
+                assert machine.state.submission_status == 'uploaded'
+                assert upload.call_count == 1
+
+    def rejected_no_upload():
+        machine, _, _ = make_machine(upload_port=12345, upload_on_approve=True)
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'a.txt'
+            target.write_bytes(b'a')
+            with mock.patch.object(student_core, 'upload_file') as upload:
+                for accept, arg2, arg3 in ((0, 1, 1), (1, 0, 1), (1, 1, 0), (1, 0, 1024)):
+                    machine.submit_files([str(target)])
+                    guid = uuid.UUID(bytes_le=bytes.fromhex(
+                        machine.state.pending_submission.transaction_guid))
+                    response = protocol.build_submit_response(42, accept, arg2, arg3,
+                                                              transaction_guid=guid)
+                    machine.handle_packet(response, 'main', machine.config.teacher_ip)
+                    assert machine.state.submission_status == 'rejected'
+                    assert machine.state.pending_submission is None
+                    assert '不会发送文件内容' in machine.state.submission_detail
+                    upload.assert_not_called()
+
+    def upload_failure_status():
+        machine, _, events = make_machine(upload_port=12345, upload_on_approve=True)
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / 'first.txt'
+            second = Path(directory) / 'second.txt'
+            first.write_bytes(b'first')
+            second.write_bytes(b'second!')
+            with mock.patch.object(student_core, 'upload_file',
+                                   side_effect=[5, OSError('模拟上传失败')]) as upload, \
+                    mock.patch.object(student_core.subprocess, 'Popen') as popen, \
+                    mock.patch.object(student_core.webbrowser, 'open') as browser:
+                machine.submit_files([str(first), str(second)])
+                approve(machine)
+                assert machine.state.submission_status == 'upload_failed'
+                assert upload.call_count == 2
+                detail = machine.state.submission_detail
+                assert '1/2' in detail and '12 字节' in detail
+                assert '模拟上传失败' in detail
+                assert str(first.resolve()) in detail and str(second.resolve()) in detail
+                assert any('已上传' in text and first.name in text for _, text in events)
+                assert any('上传失败' in text and second.name in text for _, text in events)
+                popen.assert_not_called()
+                browser.assert_not_called()
+            with mock.patch.object(student_core, 'upload_file') as upload:
+                machine.submit_files([str(first)])
+                guid = uuid.UUID(bytes_le=bytes.fromhex(
+                    machine.state.pending_submission.transaction_guid))
+                machine.handle_packet(
+                    protocol.build_submit_response(42, 1, 0, 1024, 3, transaction_guid=guid),
+                    'main', machine.config.teacher_ip)
+                assert machine.state.submission_status == 'rejected'
+                assert 'arg2=0' in machine.state.submission_detail
+                upload.assert_not_called()
+
+    def upload_skips_non_files():
+        machine, _, events = make_machine(upload_port=12345, upload_on_approve=True)
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'a.txt'
+            target.write_bytes(b'a')
+            machine.submit_files([str(target)])
+            target.unlink()
+            target.mkdir()
+            with mock.patch.object(student_core, 'upload_file') as upload:
+                approve(machine)
+                upload.assert_not_called()
+                assert machine.state.submission_status == 'upload_failed'
+                assert '路径不是文件' in machine.state.submission_detail
+                assert any('上传跳过' in text for _, text in events)
+
+    def upload_port_validation():
+        for port in (-1, 65536, 99999):
+            try:
+                StudentConfig('192.0.2.10', '192.0.2.20', upload_port=port,
+                              upload_on_approve=True)
+            except ValueError as exc:
+                assert '上传端口' in str(exc)
+            else:
+                raise AssertionError(f'非法上传端口 {port} 未被拒绝')
+        for port in (0, 1, 65535):
+            assert StudentConfig('192.0.2.10', '192.0.2.20', upload_port=port).upload_port == port
+        assert not StudentConfig('192.0.2.10', '192.0.2.20').upload_enabled
+        assert not StudentConfig('192.0.2.10', '192.0.2.20',
+                                 upload_port=12345).upload_enabled
+        assert not StudentConfig('192.0.2.10', '192.0.2.20',
+                                 upload_on_approve=True).upload_enabled
+        assert StudentConfig('192.0.2.10', '192.0.2.20',
+                             upload_port=65535, upload_on_approve=True).upload_enabled
+
+    def cli_gui_upload_options():
+        try:
+            from . import student_sim
+        except ImportError:
+            import student_sim
+        parser = student_sim.build_parser()
+        defaults = parser.parse_args(['--cli'])
+        assert defaults.submission_port == 0 and defaults.upload_on_approve is False
+        help_text = parser.format_help()
+        assert '--submission-port' in help_text and '--upload-on-approve' in help_text
+        args = parser.parse_args(['--gui', '--teacher-ip', '192.0.2.10',
+                                  '--bind-ip', '192.0.2.20',
+                                  '--submission-port', '12345', '--upload-on-approve'])
+        config = student_sim.make_config(args)
+        assert config.upload_port == 12345 and config.upload_on_approve is True
+        assert config.upload_enabled
+        text = student_sim.status_text(StudentMachine(config))
+        assert '上传模式：启用' in text and '192.0.2.10:12345' in text
+        plain = student_sim.make_config(parser.parse_args(
+            ['--cli', '--teacher-ip', '192.0.2.10', '--bind-ip', '192.0.2.20']))
+        assert plain.upload_port == 0 and not plain.upload_on_approve
+        assert '上传模式：禁用' in student_sim.status_text(StudentMachine(plain))
+        assert '上传' in student_sim.CLI_HELP
+        assert 'status_text' in inspect.getsource(student_sim.run_cli)
+        assert 'status_text' in inspect.getsource(student_sim.run_gui)
+        for port in ('-1', '65536'):
+            bad = parser.parse_args(['--cli', '--teacher-ip', '192.0.2.10',
+                                     '--bind-ip', '192.0.2.20',
+                                     '--submission-port', port])
+            try:
+                student_sim.make_config(bad)
+            except ValueError as exc:
+                assert '上传端口' in str(exc)
+            else:
+                raise AssertionError(f'CLI 非法端口 {port} 未被拒绝')
+
     for name, function in (
         ('报文构造与聊天/ANNO', packets), ('系统信息与列表分片', information),
         ('QRMS/RRMS 构造与严格解析', submission),
         ('文件提交状态/拒绝/校验/重复', submission_state),
+        ('所选绝对路径与目录拒绝', submission_paths_and_directory_rejected),
         ('登录与信息请求状态', login_and_info),
         ('黑屏与解除状态', blackscreen), ('媒体/远控/LPNT 可见事件', media_and_control),
         ('危险动作即使 execute 也不执行', dangerous_actions), ('默认观察模式', observation_defaults),
         ('拒绝同机同 IP 配置', same_ip_rejected), ('无网络关闭与失败回滚', close_without_network),
+        ('上传配置端口校验', upload_port_validation),
+        ('默认禁用/仅审批不建立上传连接', upload_gates),
+        ('批准后上传两个文件与重复回复', upload_on_approve_two_files),
+        ('GUID/来源/ID 不匹配不上传', guid_mismatch_no_upload),
+        ('拒绝提交不上传', rejected_no_upload),
+        ('上传失败状态与拒绝逻辑不受影响', upload_failure_status),
+        ('绝不上传目录或未选文件', upload_skips_non_files),
+        ('CLI/GUI 上传参数与状态行', cli_gui_upload_options),
     ):
         check(name, function)
     print(f'自检结果：{sum(ok for _, ok, _ in checks)}/{len(checks)} 通过')

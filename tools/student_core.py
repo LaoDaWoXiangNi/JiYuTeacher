@@ -23,6 +23,15 @@ except ImportError:
 LOGGER = logging.getLogger('student_sim')
 
 
+def upload_file(host: str, port: int, path: str):
+    """按需加载独立上传工具，避免导入 student_core 时连到教师 MiniMedia。"""
+    try:
+        from .minimedia_client import upload_file as client_upload_file
+    except ImportError:
+        from minimedia_client import upload_file as client_upload_file
+    return client_upload_file(host, port, path)
+
+
 @dataclass(frozen=True)
 class StudentConfig:
     teacher_ip: str
@@ -33,6 +42,8 @@ class StudentConfig:
     main_port: int = protocol.MAIN_PORT
     session_port: int = 0
     execute: bool = False
+    upload_port: int = 0
+    upload_on_approve: bool = False
 
     def __post_init__(self):
         socket.inet_aton(self.teacher_ip)
@@ -42,6 +53,8 @@ class StudentConfig:
             raise ValueError('主端口必须在 1 到 65535 之间')
         if not 0 <= self.session_port <= 65535:
             raise ValueError('会话端口必须在 0 到 65535 之间')
+        if not 0 <= self.upload_port <= 65535:
+            raise ValueError('上传端口必须是 0（禁用）或 1 到 65535 之间')
         if self.teacher_ip == self.bind_ip:
             raise ValueError(
                 '教师 IP 与学生绑定 IP 相同：教师端会忽略自身 IP，且固定端口会冲突。'
@@ -56,6 +69,10 @@ class StudentConfig:
     def session_port_or_default(self) -> int:
         return self.session_port or protocol.session_endpoint(self.channel)[1]
 
+    @property
+    def upload_enabled(self) -> bool:
+        return bool(self.upload_on_approve and 0 < self.upload_port <= 65535)
+
 
 @dataclass(frozen=True)
 class PendingSubmission:
@@ -63,6 +80,7 @@ class PendingSubmission:
     student_id: int
     file_count: int
     total_size: int
+    paths: tuple[str, ...] = ()
 
 
 @dataclass
@@ -88,6 +106,13 @@ class StudentState:
         pending = self.pending_submission
         pending_text = (f'{pending.file_count} 个文件，{pending.total_size} 字节，'
                         f'GUID {pending.transaction_guid}') if pending else '无'
+        if config.upload_enabled:
+            upload_mode = (f'启用（严格批准后逐个上传所选文件 → '
+                           f'{config.teacher_ip}:{config.upload_port}）')
+        elif config.upload_on_approve:
+            upload_mode = '开关已开启但端口为 0：仅审批，不建立上传 TCP'
+        else:
+            upload_mode = '禁用（仅审批，不建立上传 TCP）'
         return [
             f"状态：{'在线' if self.online else '离线/等待登录'}",
             f'教师：{config.teacher_ip}（主 {config.main_port}，会话 {config.session_port_or_default}）',
@@ -98,6 +123,7 @@ class StudentState:
             f'文件提交：{self.submission_status}；{self.submission_detail}',
             f'待回复请求：{pending_text}',
             f'动作模式：{"受限白名单" if execute else "观察（全部仅记录）"}',
+            f'上传模式：{upload_mode}',
         ]
 
 
@@ -147,24 +173,28 @@ class StudentMachine:
         self.event('聊天发送', text)
 
     def submit_files(self, paths: Iterable[str]) -> None:
-        files = [Path(path).expanduser() for path in paths]
+        files = [Path(path).expanduser().resolve() for path in paths]
         if not files:
             raise ValueError('至少选择一个文件')
         for path in files:
             if not path.is_file():
                 raise ValueError(f'不是可提交的文件：{path}')
         total_size = sum(path.stat().st_size for path in files)
-        directory = str(files[0].resolve().parent)
+        directory = str(files[0].parent)
         file_list = '|'.join(path.name for path in files)
         student_id = self.facts.get('stu_id', 1)
         data = protocol.build_submit_request(
             self.config.teacher_ip, directory, file_list, len(files), total_size,
             student_id=student_id)
-        pending = PendingSubmission(data[12:28].hex(), student_id, len(files), total_size)
+        pending = PendingSubmission(data[12:28].hex(), student_id, len(files), total_size,
+                                    tuple(str(path) for path in files))
         self.send('QRMS', data, 'main')
         self.state.pending_submission = pending
         self.state.submission_status = 'pending'
-        self.state.submission_detail = '等待教师 RRMS 回复；不会发送文件内容'
+        self.state.submission_detail = (
+            '等待教师 RRMS 回复；严格批准后按上传模式处理所选文件'
+            if self.config.upload_enabled else
+            '等待教师 RRMS 回复；不会发送文件内容')
         self._last_submission_guid = pending.transaction_guid
         self.event('文件提交', f'已发送 QRMS 请求：{len(files)} 个文件，{total_size} 字节；'
                               f'GUID={pending.transaction_guid}；{file_list}')
@@ -197,8 +227,11 @@ class StudentMachine:
         self.state.pending_submission = None
         approved = bool(response['accept'] and response['arg2'] and response['arg3'])
         if approved:
-            self.state.submission_status = 'approved'
-            self.state.submission_detail = '教师已接受，MiniMedia 上传未实现；不会发送文件内容'
+            if self.config.upload_enabled:
+                self._upload_pending_files(pending)
+            else:
+                self.state.submission_status = 'approved'
+                self.state.submission_detail = '教师已接受；上传模式未启用，不会发送文件内容'
         else:
             self.state.submission_status = 'rejected'
             if response['accept'] and not response['arg2']:
@@ -210,6 +243,38 @@ class StudentMachine:
                     f"教师拒绝提交：accept={response['accept']}，arg2={response['arg2']}，"
                     f"arg3={response['arg3']}；不会发送文件内容")
         self.event('文件提交', self.state.submission_detail)
+
+    def _upload_pending_files(self, pending: PendingSubmission) -> None:
+        if not pending.paths:
+            self.state.submission_status = 'upload_failed'
+            self.state.submission_detail = '教师已接受，但没有显式选择的文件；未建立上传连接'
+            return
+        results: list[tuple[str, int, bool, str]] = []
+        target = f'{self.config.teacher_ip}:{self.config.upload_port}'
+        for path_text in pending.paths:
+            path = Path(path_text)
+            if not path.is_file():
+                results.append((path_text, 0, False, '路径不是文件，已跳过'))
+                self.event('文件提交', f'上传跳过：{path_text} 不是文件；未建立上传连接')
+                continue
+            size = path.stat().st_size
+            try:
+                upload_file(self.config.teacher_ip, self.config.upload_port, path_text)
+            except Exception as exc:
+                results.append((path_text, size, False, f'失败：{exc}'))
+                self.event('文件提交', f'上传失败：{path_text}（{size} 字节）→ {target}：{exc}')
+            else:
+                results.append((path_text, size, True, '成功'))
+                self.event('文件提交', f'已上传：{path_text}（{size} 字节）→ {target}')
+        succeeded = sum(1 for _, _, ok, _ in results if ok)
+        total_size = sum(size for _, size, _, _ in results)
+        self.state.submission_status = ('upload_failed' if succeeded < len(results)
+                                        else 'uploaded')
+        per_file = '；'.join(f'{path_text}（{size} 字节，{note}）'
+                            for path_text, size, _, note in results)
+        self.state.submission_detail = (
+            f'教师已接受，上传 {succeeded}/{len(results)} 个文件，共 {total_size} 字节 → '
+            f'{target}；{per_file}')
 
     def answer_info(self, rtype: int) -> int:
         packets = protocol.build_info_reply(

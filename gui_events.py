@@ -19,6 +19,7 @@ class EventChannel:
 
 preview_events = EventChannel()
 chat_events = EventChannel()
+submission_events = EventChannel()
 
 
 class LogBridge(logging.Handler):
