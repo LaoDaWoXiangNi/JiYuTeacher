@@ -2285,6 +2285,68 @@ def send_shutdown(sip, reboot=False, delay=0, force=True, text=None):
 
 
 
+REMOTE_SETTING_CATEGORY = 0x4000
+REMOTE_CHANNEL_SUBCASE = 7
+REMOTE_CHANNEL_SETTINGS_SIZE = 12
+REMOTE_CHANNEL_GUID = 'f96a6d195b2946b9ab958a143ecddc26'
+
+
+def build_remote_channel_settings_payload(channel, auto_login):
+    """构造 COMD category=0x4000 / subcase 7 实验性远程频道设置的内层 payload。
+
+    偏移相对 COMD 内层 payload（外层包 +0x2c）：
+      +0x00 category=0x4000   +0x04 flags=0   +0x08 subcase=7   +0x0c length=12
+      +0x10 settings: +0x00 未知(0)  +0x04 AutoLogin  +0x08 ChannelId
+      +0x1c 尾部 4 字节 NUL（接收端按包内 len 复制时会从 reserved 起吃掉 4 字节）
+    length 的语义未知，subcase 7 不使用它，这里只按 settings 长度填 12；
+    flags 其余位、settings +0x00 以及其它 subcase 的布局均未证实。
+    """
+    if type(channel) is not int or not 1 <= channel <= 32:
+        raise ValueError('远程频道必须是 1 到 32 的整数')
+    if type(auto_login) is not int or auto_login not in (0, 1):
+        raise ValueError('AutoLogin 必须是 0 或 1')
+    settings = struct.pack('<III', 0, auto_login, channel)
+    payload = (struct.pack('<IIII', REMOTE_SETTING_CATEGORY, 0,
+                           REMOTE_CHANNEL_SUBCASE, len(settings))
+               + settings
+               + b'\x00' * 4)
+    if len(settings) != REMOTE_CHANNEL_SETTINGS_SIZE or len(payload) != 32:
+        raise AssertionError('远程频道设置 payload 长度错误')
+    return payload
+
+
+def send_remote_channel_settings(sip, channel, auto_login):
+    """向已登录学生单播实验性远程频道设置（COMD 0x4000 / subcase 7）。
+
+    仅发送控制面：不改变教师端自身运行频道（CHANNEL_ID / SMCAST / SPORT），
+    也没有结果回执。学生端是否写入注册表、是否需要重启或重连、以及官方
+    教师端兼容性均未实机验证。
+    """
+    payload = build_remote_channel_settings_payload(channel, auto_login)
+    if not _check_student(sip, 'setchannel <学生IP> <1..32> [0|1]'):
+        return False
+    packet = build_comd_command_ex(0x80000010, payload, REMOTE_CHANNEL_GUID)
+    try:
+        sock.sendto(packet, (sip, PORT))
+    except OSError as error:
+        logger.error('[RemoteSetting] 实验性控制面发送失败 target=%s:%d '
+                     'channel=%d auto_login=%d error=%s',
+                     sip, PORT, channel, auto_login, error, exc_info=True)
+        raise
+    logger.info(
+        '[RemoteSetting] 实验性控制面 COMD category=0x4000 subcase=7 -> %s:%d '
+        'channel=%d auto_login=%d length=%d settings=%d payload=%d packet=%d；'
+        'length 语义未知（subcase 7 不使用）；不改变教师端自身运行频道；'
+        '学生端注册表写入与重启/重连效果未实机验证，官方兼容性未验证，无结果回执',
+        sip, PORT, channel, auto_login, REMOTE_CHANNEL_SETTINGS_SIZE,
+        REMOTE_CHANNEL_SETTINGS_SIZE, len(payload), len(packet))
+    print(f'[远程设置] 已向 {sip}:{PORT} 发送实验性远程频道设置：'
+          f'频道={channel}，AutoLogin={auto_login}（教师端运行频道仍为 {CHANNEL_ID}）')
+    print('[远程设置] 仅发送实验性控制面；学生端注册表写入、重启/重连'
+          '及官方兼容性未实机验证')
+    return True
+
+
 def build_dmoc():
     """构造 DMOC 包（教师端控制信息）。"""
     cg = bytes.fromhex('ce90fd383df5844c857fa35183c051f3')
@@ -3321,6 +3383,7 @@ def cmd_help():
   closeapp <ip> <hwnd|标题关键字> [f]  结束学生应用程序（按窗口句柄或标题）
   openurl <ip> <网址|路径>   在学生机打开网页/文件（ShellExecute）
   run <ip> <路径> [参数] [show]  远程运行程序（show: 0=正常 1=最小化 2=最大化，路径含空格用引号）
+  setchannel <ip> <1..32> [0|1]  实验性远程频道设置（COMD 0x4000/subcase 7；不改变教师端频道）
   blackscreen / bs <ip> [lock=1|0] [text]   向指定学生发送黑屏安静（默认锁键鼠，10秒自动解锁）
   bsperm / bsp <ip> [lock=1|0] [text]       向指定学生发送永久黑屏安静（需手动 unlock）
   unlock <ip>           解锁指定学生的黑屏/键盘鼠标锁
@@ -3341,7 +3404,11 @@ def cmd_help():
     mouse 192.168.2.139 move 32768 32768
     key 192.168.2.139 0x41 press  按一次 A 键
     shutdown 192.168.2.139        立即强制关机
-    reboot 192.168.2.139 30 请保存作业  倒计时30秒重启并显示提示文字''')
+    reboot 192.168.2.139 30 请保存作业  倒计时30秒重启并显示提示文字
+    setchannel 192.168.2.139 7 0   实验性远程频道设置：频道7，不启用自动登录
+
+  远程频道设置是实验性控制面：只证实 subcase 7 的 AutoLogin / ChannelId 字段，
+  length 与其它 subcase 未知；学生端注册表写入、重启/重连及官方兼容性未实机验证。''')
 
 
 def cmd_list():
@@ -3664,6 +3731,26 @@ def cmd_debug(args):
 
 
 
+def cmd_setchannel(args):
+    """setchannel <学生IP> <1..32> [0|1]：实验性远程频道设置。"""
+    usage = 'setchannel <学生IP> <1..32> [0|1]'
+    fields = [value for part in args[1:] for value in str(part).split()]
+    if not args or not 1 <= len(fields) <= 2:
+        print(f'[命令] 用法：{usage}')
+        return
+    sip = args[0]
+    try:
+        channel = int(fields[0], 10)
+        auto_login = int(fields[1], 10) if len(fields) > 1 else 0
+        if send_remote_channel_settings(sip, channel, auto_login):
+            print('[远程设置] 仅发送实验性控制面；学生端注册表写入、重启/重连'
+                  '及官方兼容性未实机验证，教师端自身频道不变')
+    except ValueError as error:
+        print(f'[远程设置] 参数错误：{error}；用法：{usage}')
+    except OSError as error:
+        print(f'[远程设置] 发送失败：{error}')
+
+
 def command_loop():
     global running
     print('教师端已启动，输入 help 查看命令')
@@ -3740,6 +3827,8 @@ def command_loop():
                     print('[命令] 用法：run <学生IP> <程序路径> [参数...] [show=0|1|2]')
                 else:
                     send_run_program(args[0], path, pargs, show)
+        elif cmd == 'setchannel':
+            cmd_setchannel(args)
         elif cmd in ('blackscreen', 'bs'):
             if len(args) < 1:
                 print('[命令] 用法：blackscreen <学生IP> [lock=1|0] [提示文字]')

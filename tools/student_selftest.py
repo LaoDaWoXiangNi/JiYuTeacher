@@ -58,6 +58,30 @@ def app_packet(command, extra):
     return struct.pack('<III', protocol.MAGIC_DMOC, 0x10000, len(inner)) + uuid.uuid4().bytes_le + inner
 
 
+def patch_dword(data, offset, value):
+    buf = bytearray(data)
+    struct.pack_into('<I', buf, offset, value)
+    return bytes(buf)
+
+
+REMOTE_FIELD_OFFSETS = {
+    'category': (44, 0x4000), 'flags': (48, 0), 'subcase': (52, 7),
+    'length': (56, 12), 'unknown': (60, 0), 'auto_login': (64, 1), 'channel': (68, 9),
+}
+
+
+STATE_FIELDS = (
+    'online', 'login_replies', 'blackscreen', 'blackscreen_text', 'lock_requested',
+    'hand_up', 'preview_enabled', 'preview_version', 'screen_broadcast',
+    'student_demo', 'remote_view', 'remote_control', 'pending_submission',
+    'submission_status', 'submission_detail',
+)
+
+
+def state_snapshot(machine):
+    return {name: getattr(machine.state, name) for name in STATE_FIELDS}
+
+
 def run_self_test() -> int:
     checks = []
 
@@ -554,6 +578,244 @@ def run_self_test() -> int:
         assert StudentConfig('192.0.2.10', '192.0.2.20',
                              upload_port=65535, upload_on_approve=True).upload_enabled
 
+    def remote_channel_packet_structure():
+        packet = protocol.build_remote_channel_settings(1, 9)
+        assert len(packet) == 76
+        assert struct.unpack_from('<III', packet, 0) == (protocol.MAGIC_DMOC, 0x10000, 48)
+        assert packet[12:28] == protocol.REMOTE_CHANNEL_GUID
+        assert struct.unpack_from('<I', packet, 28)[0] == 0x80000010
+        assert struct.unpack_from('<I', packet, 36)[0] == 32
+        for name, (offset, expected) in REMOTE_FIELD_OFFSETS.items():
+            assert struct.unpack_from('<I', packet, offset)[0] == expected, name
+        assert packet[72:76] == b'\x00' * 4
+        cmd_code, cmd_id, payload = protocol.parse_comd(packet)
+        assert cmd_code == 0x80000010 and cmd_id == 7 and len(payload) == 32
+        assert protocol.parse_remote_channel_settings(payload) == (1, 9)
+        assert protocol.parse_remote_channel_comd(packet) == (1, 9)
+        for auto_login, channel in ((0, 1), (1, 32), (0, 17)):
+            other = protocol.build_remote_channel_settings(auto_login, channel)
+            assert protocol.parse_remote_channel_comd(other) == (auto_login, channel)
+            assert struct.unpack_from('<II', other, 64) == (auto_login, channel)
+        assert len(protocol.build_remote_channel_settings_payload(1, 9)) == 32
+
+    def remote_channel_state_and_status():
+        machine, sent, events = make_machine()
+        before = state_snapshot(machine)
+        assert machine.state.requested_channel is None
+        assert machine.state.requested_auto_login is None
+        assert '请求的频道/自动登录：无' in '\n'.join(
+            machine.state.status_lines(machine.config, False))
+        channel = machine.config.channel
+        group = machine.config.multicast_group
+        session_port = machine.config.session_port_or_default
+        machine.handle_packet(protocol.build_remote_channel_settings(1, 9), 'main',
+                              machine.config.teacher_ip)
+        assert machine.state.requested_channel == 9
+        assert machine.state.requested_auto_login == 1
+        assert state_snapshot(machine) == before
+        assert machine.config.channel == channel == 1
+        assert machine.config.multicast_group == group
+        assert machine.config.session_port_or_default == session_port
+        assert machine.config.main_port == protocol.MAIN_PORT
+        assert not sent
+        assert any(kind == '远程频道设置（仅提示）' and '频道 9' in text
+                   and '仅提示' in text for kind, text in events)
+        status = '\n'.join(machine.state.status_lines(machine.config, False))
+        assert '请求的频道/自动登录' in status
+        assert '频道 9' in status and '自动登录 开' in status
+        assert f'频道 1，组播 {group}' in status
+        machine.handle_packet(protocol.build_remote_channel_settings(0, 32), 'main',
+                              machine.config.teacher_ip)
+        assert machine.state.requested_channel == 32
+        assert machine.state.requested_auto_login == 0
+        assert machine.config.channel == 1
+        status = '\n'.join(machine.state.status_lines(machine.config, False))
+        assert '频道 32' in status and '自动登录 关' in status
+        assert f'频道 1，组播 {group}' in status
+
+    def remote_channel_invalid_values():
+        invalid_channels = (0, 33, 40, 255, 0xFFFFFFFF)
+        invalid_auto_logins = (2, 3, 0x100, 0xFFFFFFFF)
+        for channel in invalid_channels:
+            machine, _, events = make_machine()
+            machine.handle_packet(protocol.build_remote_channel_settings(1, channel),
+                                  'main', machine.config.teacher_ip)
+            assert machine.state.requested_channel is None, channel
+            assert machine.state.requested_auto_login is None, channel
+            assert not any(kind == '远程频道设置（仅提示）' for kind, _ in events), channel
+            assert any('远程频道设置无效' in text and 'ChannelId' in text
+                       for _, text in events), channel
+            try:
+                protocol.parse_remote_channel_settings(
+                    protocol.build_remote_channel_settings_payload(1, channel))
+            except ValueError as exc:
+                assert 'ChannelId' in str(exc)
+            else:
+                raise AssertionError(f'非法频道 {channel} 未被解析器拒绝')
+        for auto_login in invalid_auto_logins:
+            machine, _, events = make_machine()
+            machine.handle_packet(protocol.build_remote_channel_settings(auto_login, 9),
+                                  'main', machine.config.teacher_ip)
+            assert machine.state.requested_channel is None, auto_login
+            assert machine.state.requested_auto_login is None, auto_login
+            assert not any(kind == '远程频道设置（仅提示）' for kind, _ in events), auto_login
+            assert any('远程频道设置无效' in text and 'AutoLogin' in text
+                       for _, text in events), auto_login
+            try:
+                protocol.parse_remote_channel_settings(
+                    protocol.build_remote_channel_settings_payload(auto_login, 9))
+            except ValueError as exc:
+                assert 'AutoLogin' in str(exc)
+            else:
+                raise AssertionError(f'非法 AutoLogin {auto_login} 未被解析器拒绝')
+
+    def remote_channel_invalid_lengths():
+        good = protocol.build_remote_channel_settings(1, 9)
+        invalid_packets = (
+            patch_dword(good, 56, 0),
+            patch_dword(good, 56, 8),
+            patch_dword(good, 56, 16),
+            patch_dword(good, 36, 16),
+            patch_dword(good, 36, 28),
+            patch_dword(good, 36, 36),
+            patch_dword(good, 8, 52),
+            good[:-4],
+            good + b'\x00',
+            good + b'\x00' * 4,
+        )
+        for packet in invalid_packets:
+            machine, _, events = make_machine()
+            machine.handle_packet(packet, 'main', machine.config.teacher_ip)
+            assert machine.state.requested_channel is None, len(packet)
+            assert machine.state.requested_auto_login is None, len(packet)
+            assert not any(kind == '远程频道设置（仅提示）' for kind, _ in events)
+        payload = protocol.build_remote_channel_settings_payload(1, 9)
+        for length in (0, 8, 16, 28, 31, 33, 36):
+            candidate = payload[:length].ljust(length, b'\x00')
+            try:
+                protocol.parse_remote_channel_settings(candidate)
+            except ValueError as exc:
+                assert '负载长度' in str(exc)
+            else:
+                raise AssertionError(f'负载长度 {length} 未被拒绝')
+
+    def remote_channel_invalid_fields():
+        payload = protocol.build_remote_channel_settings_payload(1, 9)
+        for offset, value in ((0, 0x200), (4, 1), (8, 8), (12, 11), (16, 1), (28, 1)):
+            try:
+                protocol.parse_remote_channel_settings(patch_dword(payload, offset, value))
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'偏移 {offset} 的非法字段未被拒绝')
+        good = protocol.build_remote_channel_settings(1, 9)
+        for offset in (48, 60, 72):
+            machine, _, events = make_machine()
+            machine.handle_packet(patch_dword(good, offset, 1), 'main',
+                                  machine.config.teacher_ip)
+            assert machine.state.requested_channel is None, offset
+            assert machine.state.requested_auto_login is None, offset
+            assert not any(kind == '远程频道设置（仅提示）' for kind, _ in events), offset
+
+    def remote_channel_other_subcases():
+        for subcase in (0, 1, 2, 3, 6, 8, 0x100):
+            packet = patch_dword(protocol.build_remote_channel_settings(1, 9), 52, subcase)
+            machine, _, events = make_machine()
+            machine.handle_packet(packet, 'main', machine.config.teacher_ip)
+            assert machine.state.requested_channel is None, subcase
+            assert machine.state.requested_auto_login is None, subcase
+            assert not any(kind == '远程频道设置（仅提示）' for kind, _ in events), subcase
+            assert any('未知远程设置子命令' in text and f'subcase={subcase}' in text
+                       for _, text in events), subcase
+        assert protocol.REMOTE_CHANNEL_SUBCASE == 7
+
+    def remote_channel_no_side_effects():
+        machine, sent, events = make_machine(execute=True)
+        assert machine.config.execute
+        before = state_snapshot(machine)
+        config_before = (machine.config.teacher_ip, machine.config.bind_ip,
+                         machine.config.channel, machine.config.main_port,
+                         machine.config.session_port, machine.config.multicast_group,
+                         machine.config.session_port_or_default)
+        with mock.patch.object(student_core.socket, 'socket') as sock, \
+                mock.patch.object(student_core.subprocess, 'Popen') as popen, \
+                mock.patch.object(student_core.webbrowser, 'open') as browser, \
+                mock.patch.object(student_core, 'upload_file') as upload:
+            machine.handle_packet(protocol.build_remote_channel_settings(1, 9), 'main',
+                                  machine.config.teacher_ip)
+            machine.handle_packet(protocol.build_remote_channel_settings(0, 32), 'main',
+                                  machine.config.teacher_ip)
+            sock.assert_not_called()
+            popen.assert_not_called()
+            browser.assert_not_called()
+            upload.assert_not_called()
+        assert not sent
+        assert state_snapshot(machine) == before
+        assert (machine.config.teacher_ip, machine.config.bind_ip,
+                machine.config.channel, machine.config.main_port,
+                machine.config.session_port, machine.config.multicast_group,
+                machine.config.session_port_or_default) == config_before
+        assert machine.state.requested_channel == 32
+        assert machine.state.requested_auto_login == 0
+        assert any('不重绑端口' in text and '不改注册表' in text
+                   and '不修改实际频道' in text for _, text in events)
+        assert 'winreg' not in inspect.getsource(student_core)
+
+    def remote_channel_keeps_dangerous_defaults():
+        machine, _, events = make_machine(execute=True)
+        with mock.patch.object(student_core.socket, 'socket') as sock, \
+                mock.patch.object(student_core.subprocess, 'Popen') as popen, \
+                mock.patch.object(student_core.webbrowser, 'open') as browser:
+            machine.handle_packet(protocol.build_remote_channel_settings(1, 9), 'main',
+                                  machine.config.teacher_ip)
+            for command in (0x13, 0x14, 6):
+                machine.handle_packet(app_packet(command, b'\x00' * 40), 'main',
+                                      machine.config.teacher_ip)
+            machine.handle_packet(app_packet(0x18,
+                                  'file:///C:/Windows/System32/calc.exe'.encode('utf-16-le')
+                                  + b'\x00\x00'), 'main', machine.config.teacher_ip)
+            machine.handle_packet(app_packet(0x0F, struct.pack('<I', 1) +
+                                  r'C:\Windows\System32\cmd.exe'.encode('utf-16-le')
+                                  .ljust(512, b'\x00') + b'\x00' * 324),
+                                  'main', machine.config.teacher_ip)
+            sock.assert_not_called()
+            popen.assert_not_called()
+            browser.assert_not_called()
+        assert machine.state.requested_channel == 9
+        assert any('关机' in text for _, text in events)
+        assert any('重启' in text for _, text in events)
+        plain, _, _ = make_machine(execute=False)
+        with mock.patch.object(student_core.subprocess, 'Popen') as popen, \
+                mock.patch.object(student_core.webbrowser, 'open') as browser:
+            plain.handle_packet(protocol.build_remote_channel_settings(0, 5), 'main',
+                                plain.config.teacher_ip)
+            assert not plain.safe_open_url('https://example.com')
+            assert not plain.safe_run_program('notepad.exe', '', 0)
+            popen.assert_not_called()
+            browser.assert_not_called()
+        assert plain.state.requested_channel == 5
+
+    def remote_channel_cli_gui_visible():
+        try:
+            from . import student_sim
+        except ImportError:
+            import student_sim
+        machine, _, _ = make_machine()
+        client = student_core.UdpStudentClient(machine)
+        machine.handle_packet(protocol.build_remote_channel_settings(1, 9), 'main',
+                              machine.config.teacher_ip)
+        timeline = list(client.drain_events())
+        assert any(kind == '远程频道设置（仅提示）' for kind, _ in timeline)
+        assert any('远程频道设置' in text for _, text in timeline)
+        text = student_sim.status_text(machine)
+        assert '请求的频道/自动登录' in text
+        assert '频道 9' in text and '自动登录 开' in text
+        assert '频道 1，组播' in text
+        assert 'status_text' in inspect.getsource(student_sim.run_cli)
+        assert 'status_text' in inspect.getsource(student_sim.run_gui)
+        assert '请求的频道/自动登录' in student_sim.CLI_HELP
+        assert '远程频道/自动登录' in inspect.getsource(student_sim.run_gui)
+
     def cli_gui_upload_options():
         try:
             from . import student_sim
@@ -606,6 +868,16 @@ def run_self_test() -> int:
         ('拒绝提交不上传', rejected_no_upload),
         ('上传失败状态与拒绝逻辑不受影响', upload_failure_status),
         ('绝不上传目录或未选文件', upload_skips_non_files),
+        ('远程频道设置包结构与字段偏移', remote_channel_packet_structure),
+        ('远程频道设置仅写请求值/状态行显示', remote_channel_state_and_status),
+        ('非法频道与 AutoLogin 严格拒绝', remote_channel_invalid_values),
+        ('非法长度与截断严格拒绝', remote_channel_invalid_lengths),
+        ('非法头部/保留字段严格拒绝', remote_channel_invalid_fields),
+        ('其它 0x4000 subcase 只记未知提示', remote_channel_other_subcases),
+        ('远程频道设置无任何副作用（patch socket/Popen/webbrowser）',
+         remote_channel_no_side_effects),
+        ('远程频道设置不改变默认危险动作约束', remote_channel_keeps_dangerous_defaults),
+        ('CLI/GUI 状态与时间线可见', remote_channel_cli_gui_visible),
         ('CLI/GUI 上传参数与状态行', cli_gui_upload_options),
     ):
         check(name, function)

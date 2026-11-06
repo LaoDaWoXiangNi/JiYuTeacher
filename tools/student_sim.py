@@ -116,7 +116,7 @@ CLI_HELP = '''命令：
   handup / handdown       举手 / 取消举手（ANNO 72 字节）
   submit <文件> [...]     发送 QRMS 并等待 RRMS；仅在启用上传且严格批准后上传所选文件
   info [0|1|2]           主动上报全部/窗口/进程信息
-  status                 显示当前模拟状态
+  status                 显示当前模拟状态（含请求的频道/自动登录）
   login                  立即发送 LOGI（后台也会周期保活）
   help                   显示帮助
   quit                   退出
@@ -194,7 +194,8 @@ def run_gui(config):
     window.resize(850, 680)
     central = QWidget()
     layout = QVBoxLayout(central)
-    warning = QLabel('观察/受限模式：黑屏、锁屏、远控、关机、重启、杀进程始终只提示，绝不执行。')
+    warning = QLabel('观察/受限模式：黑屏、锁屏、远控、关机、重启、杀进程、'
+                     '远程频道/自动登录设置始终只提示，绝不执行。')
     warning.setWordWrap(True)
     warning.setStyleSheet('color: #a33; font-weight: bold; padding: 6px;')
     layout.addWidget(warning)

@@ -645,6 +645,7 @@ class MainWindow(QMainWindow):
             ('解除黑屏', 'unlock', lambda: self.selected(core.send_unlock)),
             ('远程运行', 'play', lambda: self.selected(self.run_dialog)),
             ('打开网页', 'settings', lambda: self.selected(self.url_dialog)),
+            ('远程频道', 'settings', self.remote_channel_dialog),
             ('结束进程', 'terminal', self.kill_selected_process),
             ('关闭窗口', 'devices', self.close_selected_window),
             ('关机 / 重启', 'power', lambda: self.selected(self.power_dialog)),
@@ -1472,6 +1473,60 @@ class MainWindow(QMainWindow):
         if self.run_action(core.start_student_demo, source_ip, port):
             QMessageBox.information(self, '实验性控制包已发送',
                                     '仅语音启停控制有静态证据；不代表学生屏幕已广播。')
+
+    def remote_channel_dialog(self):
+        ip = self.current_ip
+        if not ip:
+            QMessageBox.information(self, '尚未选择终端', '请先选择一台在线终端。')
+            return
+        channel, accepted = QInputDialog.getInt(
+            self, '实验性远程频道设置', '学生端频道（1–32）：',
+            core.CHANNEL_ID, 1, 32)
+        if not accepted:
+            core.logger.info('[UI] 远程频道设置取消 target=%s reason=频道输入取消', ip)
+            return
+        login_box = QMessageBox(self)
+        login_box.setWindowTitle('自动登录选择')
+        login_box.setText(f'终端：{ip}\n目标频道：{channel}\n\n是否写入 AutoLogin=1（自动登录）？')
+        login_box.setInformativeText(
+            '实验性控制面：只发送 COMD category=0x4000 / subcase 7 设置包，'
+            '不改变教师端自身运行频道。学生端注册表写入、重启/重连风险及'
+            '官方教师端兼容性均未实机验证。')
+        enable_button = login_box.addButton('启用自动登录（1）',
+                                            QMessageBox.ButtonRole.YesRole)
+        disable_button = login_box.addButton('不启用自动登录（0）',
+                                             QMessageBox.ButtonRole.NoRole)
+        cancel_button = login_box.addButton('取消', QMessageBox.ButtonRole.RejectRole)
+        login_box.setDefaultButton(cancel_button)
+        login_box.exec()
+        clicked = login_box.clickedButton()
+        if clicked is enable_button:
+            auto_login = 1
+        elif clicked is disable_button:
+            auto_login = 0
+        else:
+            core.logger.info('[UI] 远程频道设置取消 target=%s channel=%d '
+                             'reason=自动登录选择取消', ip, channel)
+            return
+        detail = (f'终端：{ip}\n目标频道：{channel}\nAutoLogin：{auto_login}\n\n'
+                  '这是实验性控制面：只向该学生单播 COMD category=0x4000 / subcase 7 '
+                  '远程设置包，不改变教师端自身运行频道。\n'
+                  '学生端可能需要重启或重连后生效，并有掉线风险；注册表写入、'
+                  '实际频道切换与官方教师端兼容性均未实机验证，也没有结果回执。')
+        if not self.confirm('二次确认 · 远程频道', detail):
+            core.logger.info('[UI] 远程频道设置取消 target=%s channel=%d '
+                             'auto_login=%d reason=二次确认取消',
+                             ip, channel, auto_login)
+            return
+        core.logger.info('[UI] 远程频道设置发起 target=%s channel=%d auto_login=%d '
+                         '（实验性控制面，教师端自身频道不变）', ip, channel, auto_login)
+        if self.run_action(core.send_remote_channel_settings, ip, channel,
+                           auto_login) is not False:
+            QMessageBox.information(
+                self, '实验性控制包已发送',
+                f'已向 {ip} 单播远程频道设置（频道 {channel}，AutoLogin {auto_login}）。\n\n'
+                '只发送了控制面：学生端注册表写入、频道切换与重启/重连效果均未实机验证，'
+                '官方教师端兼容性未验证。教师端自身运行频道未改变。')
 
     def card_action(self, action, ip):
         self.select_student(ip)

@@ -101,11 +101,19 @@ class StudentState:
     submission_status: str = 'idle'
     submission_detail: str = '尚未发送文件提交请求'
     last_teacher_packet: float = 0.0
+    requested_channel: int | None = None
+    requested_auto_login: int | None = None
 
     def status_lines(self, config: StudentConfig, execute: bool) -> list[str]:
         pending = self.pending_submission
         pending_text = (f'{pending.file_count} 个文件，{pending.total_size} 字节，'
                         f'GUID {pending.transaction_guid}') if pending else '无'
+        if self.requested_channel is None:
+            requested = '无'
+        else:
+            requested = (f'频道 {self.requested_channel}，自动登录 '
+                         f'{"开" if self.requested_auto_login else "关"}'
+                         '（仅观察，不修改实际频道）')
         if config.upload_enabled:
             upload_mode = (f'启用（严格批准后逐个上传所选文件 → '
                            f'{config.teacher_ip}:{config.upload_port}）')
@@ -117,6 +125,7 @@ class StudentState:
             f"状态：{'在线' if self.online else '离线/等待登录'}",
             f'教师：{config.teacher_ip}（主 {config.main_port}，会话 {config.session_port_or_default}）',
             f'学生：{config.bind_ip}，频道 {config.channel}，组播 {config.multicast_group}',
+            f'请求的频道/自动登录：{requested}',
             f'黑屏：{"是（仅提示）" if self.blackscreen else "否"}；举手：{"是" if self.hand_up else "否"}',
             f'广播：{"是" if self.screen_broadcast else "否"}；演示：{"是（仅提示）" if self.student_demo else "否"}；'
             f'观看：{"是" if self.remote_view else "否"}；远控请求：{"是（不执行）" if self.remote_control else "否"}',
@@ -431,10 +440,28 @@ class StudentMachine:
         except ValueError:
             self.event('控制信息', f'收到 DMOC/COMD，共 {len(data)} 字节')
             return
-        if cmd_code != 0x80000010 or len(payload) < 12:
+        if cmd_code != protocol.COMD_COMMAND_CODE or len(payload) < 12:
             self.observe_only('COMD 命令', f'code=0x{cmd_code:08X}, {len(payload)} 字节')
             return
         category, _, command = struct.unpack_from('<III', payload)
+        if category == protocol.REMOTE_SETTING_CATEGORY:
+            if command != protocol.REMOTE_CHANNEL_SUBCASE:
+                self.observe_only('未知远程设置子命令',
+                                  f'category=0x{category:X}, subcase={command}, '
+                                  f'{len(payload)} 字节；完整远程设置结构未知')
+                return
+            try:
+                auto_login, channel = protocol.parse_remote_channel_comd(data)
+            except ValueError as exc:
+                self.observe_only('远程频道设置无效', f'{exc}；仅提示，不执行任何动作')
+                return
+            self.state.requested_auto_login = auto_login
+            self.state.requested_channel = channel
+            self.event('远程频道设置（仅提示）',
+                       f'远程频道设置：请求频道 {channel}，自动登录 '
+                       f'{"开" if auto_login else "关"}；仅提示，'
+                       '不重绑端口、不改注册表、不修改实际频道、不执行任何系统动作')
+            return
         command_id = command & 0x0FFFFFFF
         if category != 0x200:
             self.observe_only('COMD 非应用命令', f'category=0x{category:X}, command=0x{command:X}')

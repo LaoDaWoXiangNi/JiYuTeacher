@@ -41,7 +41,7 @@ CLI 输入 `help` 查看命令，主要包括 `chat 文本`、`handup`、`handdo
 - 用系统浏览器请求打开格式有效的 `http://` 或 `https://` 地址；
 - Windows 上无参数启动 System32 中实际存在的 `notepad.exe` 或 `calc.exe`，绝对路径也必须准确指向白名单目标。
 
-无论是否指定 `--execute`，黑屏、锁屏/锁键鼠、远程控制、关机、重启、结束窗口或进程都 **只提示，绝不执行**。工具没有这些危险动作的实现分支。
+无论是否指定 `--execute`，黑屏、锁屏/锁键鼠、远程控制、关机、重启、结束窗口或进程都 **只提示，绝不执行**。工具没有这些危险动作的实现分支。教师端实验性的远程频道/自动登录设置也只观察请求值，不重绑端口、不改注册表、不修改实际频道（见下文）。
 
 ## 支持矩阵
 
@@ -55,6 +55,7 @@ CLI 输入 `help` 查看命令，主要包括 `chat 文本`、`handup`、`handdo
 | 文件提交 | 已实现 QRMS 请求与 52 字节 RRMS 接收/状态处理；默认绝不自动发送文件内容，MiniMedia 上传需显式开启（独立实验工具见下文） |
 | 黑屏/解除、锁屏提示 | 仅状态与提示，不创建黑屏或锁输入 |
 | 远程运行、网页、关机/重启、杀进程 | 默认仅提示；仅上述白名单可执行 |
+| 远程频道/自动登录 | 仅观察：识别 COMD `category=0x4000` / `subcase=7`，严格校验后只记录请求值，状态行显示"请求的频道/自动登录"，时间线记"远程频道设置（仅提示）"；不重绑端口、不改注册表、不修改实际频道、不执行系统动作 |
 | 屏幕广播、连续观看、远控请求 | 仅事件和状态 |
 | 学生演示 feature 4 | 仅语音启停状态与 ANNO `0x04` 回报，不连接语音或广播屏幕 |
 | 缩略图、桌面视频、远控输入 | 未实现 |
@@ -68,6 +69,16 @@ CLI 输入 `help` 查看命令，主要包括 `chat 文本`、`handup`、`handdo
 - RRMS 固定 52 字节：28 字节公共头（`RRMS`、版本 `0x10000`、声明长度 `0x18`、GUID）和 `<6I>` 负载（学生 ID、`accept`、`arg2`、64 位配额、最大文件数）。长度、魔数、版本或声明长度不符时忽略；来源不是教师、GUID/学生 ID 不匹配时也忽略并记录。
 - 仅 `accept != 0 && arg2 != 0 && arg3 != 0` 为批准。拒绝会显示教师拒绝；`arg2=0` 单独显示配额/文件数限制。重复回复只记录，新 QRMS 会替换 pending 请求。
 - 默认批准只把状态改为 `approved` 并提示不会发送文件内容。只有显式开启上传开关（非零 `--submission-port` 且 `--upload-on-approve`）时，才会在严格批准后按需调用独立工具 `tools/minimedia_client.py`，逐个上传用户显式选择的文件；该工具没有默认端口，见下文。
+
+### 远程频道/自动登录（仅观察）
+
+教师端实验性控制面会单播一个 COMD 包：外层是 `build_comd_command_ex` 的 DMOC/COMD 包装（`cmd_code=0x80000010`），内层 payload 共 32 字节，为 `<IIII>`（`category=0x4000`、`flags=0`、`subcase=7`、`length=12`）+ `<III>`（未知字段 0、`AutoLogin`、`ChannelId`）+ 末尾 4 字节 NUL。
+
+`tools/student_protocol.py` 提供独立构造器 `build_remote_channel_settings()` 与严格解析器 `parse_remote_channel_comd()` / `parse_remote_channel_settings()`，仅供自检使用，不导入也不依赖教师端代码。学生端严格校验包总长、声明长度、负载长度 32、各字段位置、频道 `1..32` 与 `AutoLogin` `0/1`；非法包、非法字段和其它 `category=0x4000` subcase 都只产生可见提示事件，不写入状态、不执行动作。
+
+合法包**只**把 `requested_channel` / `requested_auto_login` 写入 `StudentState`，状态行显示"请求的频道/自动登录"，时间线产生"远程频道设置（仅提示）"事件。绝不重新绑定端口、修改注册表、修改实际频道或执行任何系统动作；`--channel`、`--main-port`、`--session-port`、组播组、会话端口、观察模式与危险动作白名单约束全部保持不变。CLI 的 `status` 与 GUI 状态区、事件时间线会自动显示，无需新增命令；`--execute` 也不改变此行为。
+
+**完整远程设置大结构未知**：静态证据只证实内层 payload 的 `+0x00 category`、`+0x04 flags`、`+0x08 subcase`、`+0x0c length`、`+0x10 settings` 五个字段位置，以及 `subcase=7` 中 settings `+0x04 AutoLogin`、`+0x08 ChannelId` 两个 DWORD。`length` 的精确语义、settings `+0x00` 的含义、其余七路 subcase 的完整布局/默认值/枚举，以及注册表写入、频道切换、重启/重连效果与官方师生端兼容性均未证实；工具不伪造常量，也不实现这些设置。
 
 ## 与 `teacher_gui.py` 联调
 

@@ -28,6 +28,14 @@ HAND_UP_FLAG = 0x100000
 STUDENT_GUID = uuid.UUID('f96a6d19-5b29-46b9-ab95-8a143ecddc26')
 LPNT_GUID = bytes.fromhex('aa3a8dbe2b906645908ea29526218540')
 
+COMD_COMMAND_CODE = 0x80000010
+REMOTE_SETTING_CATEGORY = 0x4000
+REMOTE_CHANNEL_SUBCASE = 7
+REMOTE_CHANNEL_SETTINGS_SIZE = 12
+REMOTE_CHANNEL_PAYLOAD_SIZE = 32
+REMOTE_CHANNEL_TRAILER = b'\x00' * 4
+REMOTE_CHANNEL_GUID = bytes.fromhex('f96a6d195b2946b9ab958a143ecddc26')
+
 
 def session_endpoint(channel: int) -> tuple[str, int]:
     if not 1 <= channel <= 32:
@@ -341,6 +349,68 @@ def parse_comd(data: bytes) -> tuple[int, int, bytes]:
     if payload_len > declared - 16 or len(data) < 44 + payload_len:
         raise ValueError('COMD 负载长度无效')
     return cmd_code, cmd_id, data[44:44 + payload_len]
+
+
+def build_remote_channel_settings_payload(auto_login: int, channel: int) -> bytes:
+    """构造 COMD category=0x4000 / subcase 7 内层 payload（仅用于自检）。
+
+    与教师端 build_remote_channel_settings_payload 等价；不校验语义范围，
+    以便自检构造非法频道/AutoLogin 包观察学生端的拒绝行为。
+    """
+    settings = struct.pack('<III', 0, auto_login & 0xFFFFFFFF, channel & 0xFFFFFFFF)
+    return (struct.pack('<IIII', REMOTE_SETTING_CATEGORY, 0,
+                        REMOTE_CHANNEL_SUBCASE, len(settings))
+            + settings + REMOTE_CHANNEL_TRAILER)
+
+
+def build_remote_channel_settings(auto_login: int, channel: int, cmd_id: int = 7,
+                                  guid: bytes = REMOTE_CHANNEL_GUID) -> bytes:
+    """构造完整 DMOC/COMD 远程频道设置包（仅用于自检，不依赖教师端代码）。
+
+    等价于教师端 build_comd_command_ex(COMD_COMMAND_CODE, payload, guid)。
+    """
+    if len(guid) != 16:
+        raise ValueError('GUID 必须为 16 字节')
+    payload = build_remote_channel_settings_payload(auto_login, channel)
+    inner = struct.pack('<IIII', COMD_COMMAND_CODE, cmd_id, len(payload), 0) + payload
+    return struct.pack('<III', MAGIC_DMOC, 0x10000, len(inner)) + guid + inner
+
+
+def parse_remote_channel_settings(payload: bytes) -> tuple[int, int]:
+    """严格解析 COMD category=0x4000 / subcase 7 负载，返回 (AutoLogin, ChannelId)。"""
+    if len(payload) != REMOTE_CHANNEL_PAYLOAD_SIZE:
+        raise ValueError(f'远程频道设置负载长度必须为 {REMOTE_CHANNEL_PAYLOAD_SIZE} 字节，'
+                         f'实际 {len(payload)}')
+    category, flags, subcase, length = struct.unpack_from('<IIII', payload)
+    if category != REMOTE_SETTING_CATEGORY:
+        raise ValueError(f'category 必须为 0x4000，实际 0x{category:X}')
+    if flags != 0:
+        raise ValueError(f'flags 必须为 0，实际 0x{flags:X}')
+    if subcase != REMOTE_CHANNEL_SUBCASE:
+        raise ValueError(f'subcase 必须为 7，实际 {subcase}')
+    if length != REMOTE_CHANNEL_SETTINGS_SIZE:
+        raise ValueError(f'设置长度必须为 {REMOTE_CHANNEL_SETTINGS_SIZE}，实际 {length}')
+    unknown, auto_login, channel = struct.unpack_from('<III', payload, 16)
+    if unknown != 0:
+        raise ValueError(f'settings 保留字段必须为 0，实际 {unknown}')
+    if payload[28:32] != REMOTE_CHANNEL_TRAILER:
+        raise ValueError('负载尾部必须为 4 个 NUL')
+    if auto_login not in (0, 1):
+        raise ValueError(f'AutoLogin 必须为 0 或 1，实际 {auto_login}')
+    if not 1 <= channel <= 32:
+        raise ValueError(f'ChannelId 必须在 1 到 32 之间，实际 {channel}')
+    return auto_login, channel
+
+
+def parse_remote_channel_comd(data: bytes) -> tuple[int, int]:
+    """严格解析完整远程频道设置 DMOC/COMD 包，返回 (AutoLogin, ChannelId)。"""
+    cmd_code, _, payload = parse_comd(data)
+    if cmd_code != COMD_COMMAND_CODE:
+        raise ValueError(f'cmd_code 必须为 0x{COMD_COMMAND_CODE:08X}，实际 0x{cmd_code:08X}')
+    declared = struct.unpack_from('<I', data, 8)[0]
+    if len(data) != 28 + declared:
+        raise ValueError(f'DMOC/COMD 总长 {len(data)} 与声明长度 {28 + declared} 不符')
+    return parse_remote_channel_settings(payload)
 
 
 def parse_dmoc(data: bytes) -> dict:
