@@ -8,6 +8,8 @@
 import socket, struct, threading, time, random, sys, os, uuid, colorsys, ipaddress
 import logging, logging.handlers
 import queue
+import json
+import re
 import app_config
 import gui_events
 from classroom_store import ClassroomStore
@@ -17,8 +19,12 @@ import subprocess
 
 APP_DIR = os.path.dirname(sys.executable if getattr(sys, 'frozen', False)
                            else os.path.abspath(__file__))
-LOG_DIR = APP_DIR
+LOG_DIR = os.path.abspath(os.environ.get('TEACHER_LOG_DIR') or APP_DIR)
+os.makedirs(LOG_DIR, exist_ok=True)
 LOG_PATH = os.path.join(LOG_DIR, 'teacher_sim.log')
+SESSION_STATE_PATH = os.path.abspath(
+    os.environ.get('TEACHER_SESSION_STATE')
+    or os.path.join(LOG_DIR, 'teacher_network_state.json'))
 REMOTE_VIEW_DIR = os.path.join(APP_DIR, 'teacher_remote_view')
 SUBMISSION_DIR = os.path.join(APP_DIR, 'submissions')
 SUBMISSION_MAX_BYTES = 64 * 1024 * 1024
@@ -130,25 +136,56 @@ MAGIC_NAMES = {
     0x544E414C: 'LANT',
     0x4F4E4E41: 'ANNO',
     0x49474F4C: 'LOGI',
+    0x4F474F4C: 'LOGO',
     0x5353454D: 'MESS',
+    0x434E5154: 'TQNC',
+    0x54584E46: 'FNXT',
+    0x54585254: 'TRXT',
 }
 
 # 日常广播类魔数，不必逐条记录 hexdump
 ROUTINE_MAGICS = {0x434E4F4F, 0x434E414E, 0x434E4143, 0x4F4E4E41}
+CLIENT_PACKET_MAGICS = {0x434E5154, 0x54584E46, 0x54585254}
 
 students = {}
-previews = {}   # sip -> 当前正在重组的 LANT 帧
-completed_preview_frames = {}  # sip -> 最近完整接收的帧序号
-preview_policy_versions = {}   # sip -> 最近发送的 LPNT policy version
-remote_views = {}  # sip -> RemoteViewSession
-remote_controls = {}  # sip -> {'port': int, 'sock': socket.socket}
-screen_broadcasts = {}  # sip -> 广播启动参数；媒体推流会话单独管理
-student_demos = {}  # source sip -> 已发送 feature 4 的接收者；媒体监看单独管理
-remote_view_failures = {}  # sip -> 最近失败时间；避免反复触发学生端编码器
+previews = {}
+completed_preview_frames = {}
+preview_policy_versions = {}
+preview_confirmed_versions = {}
+preview_command_acks = {}
+preview_published_at = {}
+preview_image_cache = {}
+preview_last_errors = {}
+remote_views = {}
+remote_controls = {}
+screen_broadcasts = {}
+student_demos = {}
+remote_view_failures = {}
+remote_view_last_error = {}
 remote_state_lock = threading.RLock()
-last_status = {}  # (sip, key) -> 最近一条同类消息内容（重复降为 DEBUG，防止刷屏）
-running = True
+state_lock = threading.RLock()
+network_lock = threading.RLock()
+thread_lock = threading.RLock()
+shutdown_lock = threading.RLock()
+session_state_lock = threading.RLock()
+network_stop_event = threading.Event()
+background_threads = {}
+last_status = {}
+running = False
+network_started = False
+network_sockets_closed = True
+network_error = None
+# None=未退出；stopping=退出流程执行中；done=已完成。用于 shutdown 幂等。
+shutdown_stage = None
+single_instance_mutex = None
+single_instance_locked = False
+exclusive_addruse = False
+sock = None
+sock2 = None
+session_id = None
+generation = 0
 SELECTED_NETWORK = None
+_network_selection_cache = None
 SUBMISSION_PORT = 0
 submission_server = None
 submission_listen_port = None
@@ -172,6 +209,482 @@ classroom_write_thread = None
 classroom_checked_in = set()
 classroom_lock = threading.RLock()
 classroom_shutdown = False
+
+
+def _sleep_or_stop(seconds):
+    return network_stop_event.wait(seconds)
+
+
+def _start_managed_thread(name, target, args=()):
+    with thread_lock:
+        existing = background_threads.get(name)
+        if existing is not None and existing.is_alive():
+            return existing
+        if existing is not None:
+            background_threads.pop(name, None)
+        thread = threading.Thread(target=target, name=name, args=args, daemon=True)
+        background_threads[name] = thread
+        try:
+            thread.start()
+        except Exception as error:
+            background_threads.pop(name, None)
+            logger.error('[Threads] %s 启动失败：%s', name, error, exc_info=True)
+            return None
+        return thread
+
+
+def _join_thread(thread, timeout):
+    if thread is None or not hasattr(thread, 'join'):
+        return True
+    try:
+        alive = thread.is_alive()
+    except Exception:
+        alive = False
+    if not alive:
+        return True
+    if thread is threading.current_thread():
+        return False
+    try:
+        thread.join(max(0.0, timeout))
+    except (RuntimeError, OSError) as error:
+        logger.debug('[Threads] join 跳过：%s', error)
+        return False
+    try:
+        return not thread.is_alive()
+    except Exception:
+        return True
+
+
+def _join_background_threads():
+    deadline = time.monotonic() + THREAD_JOIN_TIMEOUT
+    with thread_lock:
+        threads = list(background_threads.items())
+    joined, alive = [], []
+    for name, thread in threads:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            alive.append(name)
+            continue
+        if _join_thread(thread, remaining):
+            joined.append(name)
+        else:
+            alive.append(name)
+    with thread_lock:
+        for name in joined:
+            background_threads.pop(name, None)
+    logger.info('[Threads] 有界 join 完成 joined=%s alive=%s timeout=%.2fs',
+                joined, alive, THREAD_JOIN_TIMEOUT)
+    return not alive
+
+
+def _mark_student_seen(sip, source, via='unknown', logged_in=False):
+    if not sip or sip == ip:
+        return None
+    now = time.time()
+    with state_lock:
+        entry = students.get(sip)
+        if entry is None:
+            entry = {
+                'logged_in': False,
+                'signal_only': True,
+                'first_seen': now,
+                'last_seen': now,
+                'sources': set(),
+            }
+            students[sip] = entry
+            logger.info('[Students] 发现信号源 %s via=%s source=%s', sip, via, source)
+        entry['last_seen'] = now
+        entry.setdefault('sources', set()).add(source)
+        if logged_in:
+            entry['logged_in'] = True
+            entry['signal_only'] = False
+            entry['logged_in_at'] = now
+        elif not entry.get('logged_in'):
+            entry['signal_only'] = True
+        return dict(entry)
+
+
+def _clear_student_runtime_state(sip):
+    with state_lock:
+        students.pop(sip, None)
+        previews.pop(sip, None)
+        completed_preview_frames.pop(sip, None)
+        preview_policy_versions.pop(sip, None)
+        preview_confirmed_versions.pop(sip, None)
+        preview_command_acks.pop(sip, None)
+        preview_published_at.pop(sip, None)
+        preview_image_cache.pop(sip, None)
+        preview_last_errors.pop(sip, None)
+        remote_view_failures.pop(sip, None)
+        remote_view_last_error.pop(sip, None)
+        screen_broadcasts.pop(sip, None)
+        student_demos.pop(sip, None)
+        submission_transactions.pop(sip, None)
+        for key in [key for key in last_status if key[0] == sip]:
+            last_status.pop(key, None)
+        timer = blackscreen_timers.pop(sip, None)
+    return timer
+
+
+def _handle_student_logout(sip, via='unknown'):
+    timer = _clear_student_runtime_state(sip)
+    if timer is not None:
+        timer.cancel()
+    with remote_state_lock:
+        had_view = sip in remote_views
+        had_control = sip in remote_controls
+    if had_view:
+        stop_remote_view(sip, notify=True)
+    if had_control:
+        stop_remote_control(sip, notify=True)
+    logger.info('[LOGO] %s via=%s 已清理学生/预览/观看状态', sip, via)
+
+
+def get_students_snapshot():
+    with state_lock:
+        snapshot = []
+        for sip, entry in students.items():
+            item = {
+                'ip': sip,
+                'logged_in': bool(entry.get('logged_in')),
+                'signal_only': not bool(entry.get('logged_in')),
+                'status': 'logged_in' if entry.get('logged_in') else 'signal_only',
+                'first_seen': entry.get('first_seen'),
+                'last_seen': entry.get('last_seen'),
+                'last_seen_age': max(0.0, time.time() - (entry.get('last_seen') or 0)),
+                'sources': sorted(entry.get('sources', ())),
+                'info': dict(entry.get('info', {})),
+                'mac': entry.get('info', {}).get('mac', ''),
+                'anno_state': dict(entry.get('anno_state', {})),
+            }
+            snapshot.append(item)
+    snapshot.sort(key=lambda item: item['last_seen'] or 0, reverse=True)
+    return snapshot
+
+
+def _drain_classroom_queue():
+    while True:
+        try:
+            classroom_write_queue.get_nowait()
+        except queue.Empty:
+            break
+        else:
+            classroom_write_queue.task_done()
+
+
+def _bounded_queue_join():
+    deadline = time.monotonic() + CLASSROOM_JOIN_TIMEOUT
+    while classroom_write_queue.unfinished_tasks and time.monotonic() < deadline:
+        time.sleep(0.01)
+    remaining = classroom_write_queue.unfinished_tasks
+    if remaining:
+        logger.warning('[Classroom] 写盘队列 join 超时 unfinished=%d timeout=%.2fs',
+                       remaining, CLASSROOM_JOIN_TIMEOUT)
+        _drain_classroom_queue()
+    return remaining == 0
+
+
+def _reset_classroom_writer_for_restart():
+    global classroom_shutdown, classroom_write_thread
+    with classroom_lock:
+        needs_reset = (classroom_shutdown or classroom_write_thread is None
+                       or not classroom_write_thread.is_alive())
+        if needs_reset:
+            classroom_shutdown = False
+            classroom_write_thread = None
+            classroom_checked_in.clear()
+    if needs_reset:
+        _drain_classroom_queue()
+
+
+def _next_preview_policy_versions(sip, count=1):
+    if count < 1:
+        raise ValueError('LPNT 版本数量必须大于 0')
+    with state_lock:
+        current = preview_policy_versions.get(sip, PREVIEW_POLICY_BASE)
+        if not isinstance(current, int) or current < PREVIEW_POLICY_BASE:
+            current = PREVIEW_POLICY_BASE
+        versions = list(range(current + 1, current + count + 1))
+        preview_policy_versions[sip] = versions[-1]
+        return versions
+
+
+def _send_lpnt(sip, version, enabled, label):
+    packet = build_lpnt(version, enabled)
+    ok = _send_main(packet, (sip, PORT), f'{label}/LPNT')
+    logger.info('[Preview] %s LPNT -> %s version=%d enabled=%s ok=%s',
+                label, sip, version, enabled, ok)
+    return ok
+
+
+def _send_dmoc(sip, label):
+    packet = build_dmoc()
+    ok = _send_main(packet, (sip, PORT), f'{label}/DMOC')
+    logger.debug('[Preview] %s DMOC -> %s ok=%s', label, sip, ok)
+    return ok
+
+
+def _send_preview_policy(sip, enabled, label, count=1):
+    versions = _next_preview_policy_versions(sip, count)
+    results = []
+    for index, version in enumerate(versions):
+        state = enabled if count == 1 else (False if index == 0 else True)
+        results.append(_send_lpnt(sip, version, state, label))
+    results.append(_send_dmoc(sip, label))
+    logger.info('[Preview] %s -> %s versions=%s enabled=%s sent=%s',
+                label, sip, versions, enabled, all(results))
+    return all(results)
+
+
+def _ensure_preview_keepalive(sip):
+    return _start_managed_thread(
+        f'preview-keepalive-{sip}', keep_alive_preview, (sip,))
+
+
+def _preview_missing_ranges(state):
+    total = state['total']
+    intervals = []
+    for offset, length in state.get('received', {}).items():
+        start = max(0, min(total, offset))
+        end = max(start, min(total, offset + length))
+        if end > start:
+            intervals.append((start, end))
+    intervals.sort()
+    merged = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    missing = []
+    cursor = 0
+    for start, end in merged:
+        if start > cursor:
+            missing.append((cursor, start))
+        cursor = max(cursor, end)
+    if cursor < total:
+        missing.append((cursor, total))
+    return missing
+
+
+def _preview_missing_parts(state):
+    """把按实际 offset 计算的缺失字节区间映射为 SRNT 的 0 基 uint16 分片号。"""
+    parts = []
+    for start, end in _preview_missing_ranges(state):
+        first = start // 1024
+        last = (end - 1) // 1024
+        for index in range(first, last + 1):
+            if index > 0xFFFF:
+                return parts
+            if index not in parts:
+                parts.append(index)
+            if len(parts) >= PREVIEW_MAX_MISSING_PARTS:
+                return parts
+    return parts
+
+
+def _expire_preview_frames():
+    now = time.monotonic()
+    expired = []
+    with state_lock:
+        for sip, state in list(previews.items()):
+            last_at = state.get('last_fragment_at', now)
+            if now - last_at > PREVIEW_FRAME_TTL:
+                previews.pop(sip, None)
+                preview_last_errors[sip] = '预览帧 TTL 超时'
+                expired.append(sip)
+    for sip in expired:
+        logger.info('[Preview] %s 重组帧 TTL 超时 ttl=%.2fs', sip, PREVIEW_FRAME_TTL)
+    return expired
+
+
+def get_preview_status(sip=None):
+    _expire_preview_frames()
+    with state_lock:
+        frames = {}
+        for student_ip, state in previews.items():
+            if sip is not None and student_ip != sip:
+                continue
+            missing_ranges = _preview_missing_ranges(state)
+            frames[student_ip] = {
+                'frame_seq': state.get('frame_seq'),
+                'total': state.get('total'),
+                'got': state.get('got', 0),
+                'received_offsets': sorted(state.get('received', {})),
+                'missing_ranges': [list(item) for item in missing_ranges],
+                'missing_offsets': [item[0] for item in missing_ranges],
+                'missing_parts': _preview_missing_parts(state),
+                'last_fragment_at': state.get('last_fragment_at'),
+                'age_seconds': max(0.0, time.monotonic() - (state.get('last_fragment_at') or time.monotonic())),
+                'ttl_seconds': PREVIEW_FRAME_TTL,
+                'published': False,
+                'last_error': state.get('last_error'),
+                'publish_attempts': state.get('publish_attempts', 0),
+            }
+        expected = dict(preview_policy_versions)
+        confirmed = dict(preview_confirmed_versions)
+        acks = {key: dict(value) for key, value in preview_command_acks.items()}
+        pending = {
+            key: value for key, value in expected.items()
+            if confirmed.get(key) != value
+        }
+        result = {
+            'frames': frames,
+            'published': dict(completed_preview_frames),
+            'published_at': dict(preview_published_at),
+            'policy_versions': expected,
+            'expected_versions': expected,
+            'confirmed_versions': confirmed,
+            'pending_versions': pending,
+            'command_acks': acks,
+            'last_errors': dict(preview_last_errors),
+            'cached_image_ips': sorted(preview_image_cache),
+            'ttl_seconds': PREVIEW_FRAME_TTL,
+        }
+    if sip is not None:
+        result['frames'] = frames.get(sip)
+        result['published'] = completed_preview_frames.get(sip)
+        result['policy_version'] = expected.get(sip, PREVIEW_POLICY_BASE)
+        result['expected_version'] = expected.get(sip, PREVIEW_POLICY_BASE)
+        result['confirmed_version'] = confirmed.get(sip)
+        result['command_ack_count'] = acks.get(sip, {}).get('count', 0)
+        result['policy_pending'] = sip in pending
+        result['cached_image'] = sip in preview_image_cache
+    return result
+
+
+def get_preview_image(sip):
+    with state_lock:
+        image = preview_image_cache.get(sip)
+        return image.copy() if image is not None else None
+
+
+def _set_view_error(sip, reason):
+    with remote_state_lock:
+        remote_view_last_error[sip] = reason
+
+
+def get_view_state(sip):
+    with remote_state_lock:
+        session = remote_views.get(sip)
+        failure_time = remote_view_failures.get(sip)
+        remaining = 0.0
+        if failure_time is not None:
+            remaining = max(0.0, VIEW_FAILURE_COOLDOWN - (time.monotonic() - failure_time))
+        return {
+            'active': session is not None and not session.stop_event.is_set(),
+            'connected': bool(session and session.connected_event.is_set()),
+            'cooldown_remaining': remaining,
+            'cooldown_seconds': VIEW_FAILURE_COOLDOWN,
+            'reason': remote_view_last_error.get(sip),
+            'port': session.port if session is not None else None,
+        }
+
+
+def _mac_text_to_bytes(text):
+    try:
+        parts = str(text).replace(':', '-').split('-')
+        if len(parts) != 6:
+            return None
+        return bytes(int(part, 16) for part in parts)
+    except (TypeError, ValueError):
+        return None
+
+
+def _client_mac_index():
+    with state_lock:
+        index = {}
+        for student_ip, entry in students.items():
+            raw = _mac_text_to_bytes(entry.get('info', {}).get('mac', ''))
+            if raw is not None:
+                index[raw] = student_ip
+        return index
+
+
+def _handle_client_packet(mag, d, sip, via):
+    """只识别/记录 TQNC/FNXT/TRXT；不回复、不伪造退出包。"""
+    name = MAGIC_NAMES.get(mag, f'0x{mag:08X}')
+    _mark_student_seen(sip, name, via)
+    guid = d[12:28].hex() if len(d) >= 28 else ''
+    if mag == 0x434E5154:  # TQNC
+        channel_value = (struct.unpack('<I', d[28:32])[0]
+                         if len(d) >= 32 else None)
+        logger.info('[ClientPacket] TQNC from %s via=%s len=%d channel=%s guid=%s；'
+                    '只记录频道退出通知，不回包', sip, via, len(d), channel_value, guid)
+        return True
+    if mag == 0x54584E46:  # FNXT
+        declared_len = (struct.unpack('<I', d[8:12])[0]
+                        if len(d) >= 12 else None)
+        count = struct.unpack('<I', d[32:36])[0] if len(d) >= 36 else 0
+        count = min(count, 1000)
+        ids_start = 36
+        ids_end = ids_start + 6 * count
+        visible = d[ids_start:min(ids_end, len(d))]
+        full_ids = [visible[i:i + 6] for i in range(0, len(visible) - 5, 6)]
+        missing_ids = max(0, count - len(full_ids))
+        unknown_tail = d[ids_end:ids_end + 6].hex() if len(d) >= ids_end + 6 else ''
+        expected_len = ids_end + 6
+        index = _client_mac_index()
+        matches = [
+            (i, raw.hex('-').upper(), index[raw])
+            for i, raw in enumerate(full_ids) if raw in index
+        ]
+        logger.info('[ClientPacket] FNXT from %s via=%s len=%d declared_len=%s '
+                    'guid=%s n=%d visible_ids=%d missing_ids=%d unknown_tail=%s '
+                    'expected_len=%d matches=%s；6字节ID=MESS type5 payload+0x54 MAC；'
+                    '目的封装/尾部6字节未证实，不伪造/不回包',
+                    sip, via, len(d), declared_len, guid, count, len(full_ids),
+                    missing_ids, unknown_tail, expected_len, matches)
+        return True
+    if mag == 0x54585254:  # TRXT
+        client_id = d[32:38] if len(d) >= 38 else b''
+        matched_ip = _client_mac_index().get(bytes(client_id)) if client_id else None
+        logger.info('[ClientPacket] TRXT from %s via=%s len=%d guid=%s '
+                    'client_id=%s matched_ip=%s；只记录退出确认，不回包',
+                    sip, via, len(d), guid, client_id.hex('-') if client_id else '',
+                    matched_ip)
+        return True
+    return False
+
+
+def _handle_trmc(d, sip, via):
+    """TRMC 是 DMOC 命令回执；只记录，不回 LPNT/DMOC。"""
+    _mark_student_seen(sip, 'TRMC', via)
+    client_id = (struct.unpack('<I', d[28:32])[0]
+                 if len(d) >= 32 else None)
+    with state_lock:
+        entry = preview_command_acks.setdefault(sip, {'count': 0, 'last_seen': 0.0})
+        entry['count'] += 1
+        entry['last_seen'] = time.time()
+        count = entry['count']
+    logger.info('[Preview] TRMC from %s via=%s client_id=%s count=%d；'
+                'DMOC 命令回执，不回 LPNT/DMOC', sip, via, client_id, count)
+    return True
+
+
+def _handle_trnt(d, sip, via):
+    """TRNT 携带学生已确认 policy version；仅在期望版本不同时重发同一个期望版本。
+
+    不递增版本：每个 LPNT 都会换来一个 TRNT，若每次不匹配都 +1，就会形成
+    LPNT/TRNT 版本无限升级；官方 UpdatePolicy 是重发 context+0x04 的当前期望版本。
+    """
+    _mark_student_seen(sip, 'TRNT', via)
+    if len(d) < 36:
+        logger.warning('[Preview] TRNT 包过短 from %s via=%s len=%d', sip, via, len(d))
+        return False
+    confirmed = struct.unpack('<I', d[32:36])[0]
+    with state_lock:
+        preview_confirmed_versions[sip] = confirmed
+        expected = preview_policy_versions.get(sip, PREVIEW_POLICY_BASE)
+    if confirmed == expected:
+        logger.info('[Preview] TRNT %s via=%s confirmed=%d expected=%d；策略已确认，不重发',
+                    sip, via, confirmed, expected)
+        return True
+    ok = _send_lpnt(sip, expected, True, 'TRNT mismatch')
+    logger.info('[Preview] TRNT %s via=%s confirmed=%d expected=%d -> '
+                '重发期望版本 LPNT version=%d ok=%s（不递增版本、不回 DMOC）',
+                sip, via, confirmed, expected, expected, ok)
+    return ok
 
 
 def bind_classroom_observer(callback):
@@ -339,25 +852,191 @@ def is_interesting(d, sip):
     return mag not in ROUTINE_MAGICS
 
 
+def _prefix_from_netmask(mask):
+    try:
+        values = [int(part) for part in mask.split('.')]
+    except (AttributeError, ValueError):
+        return None
+    if len(values) != 4 or any(not 0 <= value <= 255 for value in values):
+        return None
+    bits = ''.join(f'{value:08b}' for value in values)
+    if '01' in bits:
+        return None
+    return bits.count('1')
+
+
+BENCHMARK_NETWORK = ipaddress.ip_network('198.18.0.0/15')
+IPV4_PATTERN = re.compile(r'(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)')
+
+
+def _usable_ipv4(value):
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return (addr.version == 4
+            and not addr.is_loopback
+            and not addr.is_link_local
+            and not addr.is_multicast
+            and not addr.is_unspecified
+            and addr not in BENCHMARK_NETWORK)
+
+
+def _decode_console(raw):
+    for encoding in ('mbcs', 'utf-8', 'gbk'):
+        try:
+            return raw.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return raw.decode('ascii', 'replace')
+
+
+def _ipconfig_candidates():
+    """解析 ipconfig 枚举 (网卡名, 地址, 前缀, 是否有默认网关)。
+
+    PowerShell 首次调用 NetworkInterface 在本机需要数秒，而 ipconfig 是原生
+    命令，通常百毫秒级，因此优先使用它。
+    """
+    try:
+        completed = subprocess.run(
+            ['ipconfig'],
+            capture_output=True,
+            timeout=3,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.warning('ipconfig 枚举网卡失败：%s', e)
+        return []
+    text = _decode_console(completed.stdout or b'')
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    candidates = []
+    alias = ''
+    pending_alias = None
+    for block in re.split(r'\n[ \t]*\n', text):
+        lines = [line for line in block.split('\n') if line.strip()]
+        if not lines:
+            continue
+        # 中文 ipconfig 会在适配器标题与属性之间插一个空行，标题因此单独
+        # 成为一个块，需要留给下一个块使用；属性块的首行是“连接特定的
+        # DNS 后缀”，不能再当成标题。
+        if len(lines) == 1 and ':' in lines[0] and not IPV4_PATTERN.search(lines[0]):
+            pending_alias = lines[0].rsplit(':', 1)[0].strip()
+            continue
+        if (pending_alias is None and len(lines) > 1
+                and ':' in lines[0] and not IPV4_PATTERN.search(lines[0])):
+            alias = lines[0].rsplit(':', 1)[0].strip()
+            lines = lines[1:]
+        elif pending_alias is not None:
+            alias = pending_alias
+        pending_alias = None
+        address = None
+        prefix = None
+        gateway = False
+        for line in lines:
+            if ':' not in line:
+                continue
+            for token in IPV4_PATTERN.findall(line.rsplit(':', 1)[-1]):
+                token_prefix = _prefix_from_netmask(token)
+                if token_prefix is not None and address is not None and prefix is None:
+                    prefix = token_prefix
+                elif prefix is not None:
+                    gateway = True
+                else:
+                    if address is not None:
+                        candidates.append((alias, address, prefix, gateway))
+                        gateway = False
+                    address, prefix = token, None
+        if address is not None:
+            candidates.append((alias, address, prefix, gateway))
+    return candidates
+
+
+def _powershell_candidates():
+    ps_script = (
+        "$ErrorActionPreference='Stop'; "
+        "foreach($nic in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) { "
+        "if($nic.OperationalStatus -ne [System.Net.NetworkInformation.OperationalStatus]::Up) { continue }; "
+        "$props=$nic.GetIPProperties(); $gateway=$false; "
+        "foreach($gw in $props.GatewayAddresses) { "
+        "if($gw.Address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) { "
+        "$gateway=$true; break } }; "
+        "foreach($addr in $props.UnicastAddresses) { "
+        "if($addr.Address.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { continue }; "
+        "\"{0}`t{1}`t{2}`t{3}\" -f "
+        "$addr.Address.IPAddressToString,$nic.Name,$gateway,$addr.PrefixLength } }"
+    )
+    try:
+        completed = subprocess.run(
+            ['powershell', '-NoProfile', '-Command', ps_script],
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=8,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.warning('枚举 Windows 网卡失败：%s', e)
+        return []
+    candidates = []
+    for line in (completed.stdout or '').splitlines():
+        parts = line.strip().split('\t')
+        if len(parts) != 4:
+            continue
+        address, alias, has_gateway, prefix_text = parts
+        try:
+            prefix = int(prefix_text)
+        except ValueError:
+            continue
+        candidates.append((alias, address, prefix, has_gateway.lower() == 'true'))
+    return candidates
+
+
+def _choose_ipv4_candidate(candidates, peer_address, wanted_network):
+    """按默认网关、私有网段、学生端同网段的优先级挑选本机地址。"""
+    scored = []
+    for order, (alias, address_text, prefix, gateway) in enumerate(candidates):
+        if not _usable_ipv4(address_text):
+            continue
+        address = ipaddress.ip_address(address_text)
+        if wanted_network and address not in wanted_network:
+            continue
+        network = None
+        if prefix is not None:
+            try:
+                network = ipaddress.ip_network(
+                    f'{address_text}/{prefix}', strict=False)
+            except ValueError:
+                network = None
+        score = 100 if gateway else 0
+        score += 20 if address.is_private else 0
+        # 同分时优先/24 及更大的常规局域网，避免选中 VPN/TUN 的 /30 地址。
+        score += 5 if network is not None and network.prefixlen <= 24 else 0
+        if peer_address is not None and network is not None and peer_address in network:
+            score += 1000
+        scored.append((score, order, address_text, alias, network, gateway))
+    if not scored:
+        return None
+    return max(scored, key=lambda item: (item[0], -item[1]))
+
+
 def get_ip():
+    global _network_selection_cache
+    key = tuple(os.environ.get(name, '') for name in (
+        'TEACHER_IP', 'TEACHER_PEER_IP', 'TEACHER_NETWORK'))
+    if _network_selection_cache and _network_selection_cache[2] == key:
+        return _network_selection_cache[0]
+    selected = _get_ip_uncached()
+    _network_selection_cache = (selected, SELECTED_NETWORK, key)
+    return selected
+
+
+def _get_ip_uncached():
     global SELECTED_NETWORK
     SELECTED_NETWORK = None
     override = os.environ.get('TEACHER_IP', '').strip()
     peer_hint = os.environ.get('TEACHER_PEER_IP', '').strip()
     network_hint = os.environ.get('TEACHER_NETWORK', '').strip()
-    benchmark_net = ipaddress.ip_network('198.18.0.0/15')
-
-    def usable(value):
-        try:
-            addr = ipaddress.ip_address(value)
-        except ValueError:
-            return False
-        return (addr.version == 4
-                and not addr.is_loopback
-                and not addr.is_link_local
-                and not addr.is_multicast
-                and not addr.is_unspecified
-                and addr not in benchmark_net)
 
     peer_address = None
     if peer_hint:
@@ -379,7 +1058,7 @@ def get_ip():
             raise ValueError(f'TEACHER_NETWORK 不是有效 IPv4 网段：{network_hint}') from e
 
     if override:
-        if not usable(override):
+        if not _usable_ipv4(override):
             raise ValueError(f'TEACHER_IP 不是可用的 IPv4 地址：{override}')
         override_address = ipaddress.ip_address(override)
         if wanted_network and override_address not in wanted_network:
@@ -392,75 +1071,34 @@ def get_ip():
 
     # 官方逻辑枚举所有本机 IPv4，并不会按网卡名称排除虚拟接口。这里同样
     # 保留全部可用地址；可通过 TEACHER_NETWORK 选择所需网段。
+    candidates = []
     if os.name == 'nt':
-        ps_script = (
-            "$ErrorActionPreference='Stop'; "
-            "foreach($nic in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) { "
-            "if($nic.OperationalStatus -ne [System.Net.NetworkInformation.OperationalStatus]::Up) { continue }; "
-            "$props=$nic.GetIPProperties(); $gateway=$false; "
-            "foreach($gw in $props.GatewayAddresses) { "
-            "if($gw.Address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) { "
-            "$gateway=$true; break } }; "
-            "foreach($addr in $props.UnicastAddresses) { "
-            "if($addr.Address.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { continue }; "
-            "\"{0}`t{1}`t{2}`t{3}\" -f "
-            "$addr.Address.IPAddressToString,$nic.Name,$gateway,$addr.PrefixLength } }"
-        )
-        try:
-            completed = subprocess.run(
-                ['powershell', '-NoProfile', '-Command', ps_script],
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                timeout=8,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            candidates = []
-            for line in completed.stdout.splitlines():
-                parts = line.strip().split('\t')
-                if len(parts) != 4 or not usable(parts[0]):
-                    continue
-                candidate, alias, has_gateway, prefix_text = parts
-                addr = ipaddress.ip_address(candidate)
-                prefix = int(prefix_text)
-                candidate_network = ipaddress.ip_network(
-                    f'{candidate}/{prefix}', strict=False)
-                if wanted_network and addr not in wanted_network:
-                    continue
-                gateway = has_gateway.lower() == 'true'
-                score = 100 if gateway else 0
-                score += 20 if addr.is_private else 0
-                if peer_address is not None and peer_address in candidate_network:
-                    score += 1000
-                # 在同分情况下保留 PowerShell 的枚举顺序，避免地址字符串排序
-                # 意外改变选择结果。
-                candidates.append((score, candidate, alias, candidate_network, gateway))
-            if candidates:
-                logger.info('可用 IPv4 候选：%s', '; '.join(
-                    f'{candidate}/{network.prefixlen}（{alias}，默认网关={gateway}）'
-                    for score, candidate, alias, network, gateway in candidates))
-                selected_item = max(enumerate(candidates),
-                                    key=lambda item: (item[1][0], -item[0]))[1]
-                _, selected, alias, selected_network, _ = selected_item
-                SELECTED_NETWORK = selected_network
-                if peer_address and peer_address in selected_network:
-                    logger.info('按 TEACHER_PEER_IP=%s 的直连网段选择地址：%s（%s，网段=%s）',
-                                peer_hint, selected, alias, selected_network)
-                else:
-                    logger.info('自动选择局域网地址：%s（%s，网段=%s）',
-                                selected, alias, selected_network)
-                    if peer_address:
-                        logger.warning(
-                            'TEACHER_PEER_IP=%s 不在所选直连网段 %s；组播发现通常不会跨越路由器',
-                            peer_hint, selected_network)
-                return selected
-            if wanted_network:
-                raise RuntimeError(f'没有找到属于 TEACHER_NETWORK={wanted_network} 的本机地址')
-        except Exception as e:
-            if wanted_network:
-                raise
-            logger.warning('枚举 Windows 网卡失败，将使用路由探测：%s', e)
+        candidates = _ipconfig_candidates()
+        if not candidates:
+            logger.info('ipconfig 未枚举到地址，回退 PowerShell 枚举')
+            candidates = _powershell_candidates()
+    chosen = _choose_ipv4_candidate(candidates, peer_address, wanted_network)
+    if chosen is not None:
+        _, _, selected, alias, selected_network, _ = chosen
+        logger.info('可用 IPv4 候选：%s', '; '.join(
+            f'{address}/{prefix if prefix is not None else "?"}'
+            f'（{name}，默认网关={has_gateway}）'
+            for name, address, prefix, has_gateway in candidates
+            if _usable_ipv4(address)))
+        SELECTED_NETWORK = selected_network
+        if peer_address and selected_network and peer_address in selected_network:
+            logger.info('按 TEACHER_PEER_IP=%s 的直连网段选择地址：%s（%s，网段=%s）',
+                        peer_hint, selected, alias, selected_network)
+        else:
+            logger.info('自动选择局域网地址：%s（%s，网段=%s）',
+                        selected, alias, selected_network)
+            if peer_address:
+                logger.warning(
+                    'TEACHER_PEER_IP=%s 不在所选直连网段 %s；组播发现通常不会跨越路由器',
+                    peer_hint, selected_network)
+        return selected
+    if wanted_network and candidates:
+        raise RuntimeError(f'没有找到属于 TEACHER_NETWORK={wanted_network} 的本机地址')
 
     # UDP connect 只查询本机路由，不会真正向目标发送数据。优先探测
     # 指定同端，其次探测本程序使用的组播路由；外网地址只作最后尝试。
@@ -478,7 +1116,7 @@ def get_ip():
         try:
             s.connect((route_target, route_port))
             selected = s.getsockname()[0]
-            if not usable(selected):
+            if not _usable_ipv4(selected):
                 raise RuntimeError(f'得到不可用地址 {selected}')
             if wanted_network and ipaddress.ip_address(selected) not in wanted_network:
                 raise RuntimeError(
@@ -503,7 +1141,7 @@ def get_ip():
         for info in socket.getaddrinfo(
                 socket.gethostname(), None, socket.AF_INET, socket.SOCK_DGRAM):
             candidate = info[4][0]
-            if candidate not in hostname_candidates and usable(candidate):
+            if candidate not in hostname_candidates and _usable_ipv4(candidate):
                 hostname_candidates.append(candidate)
     except OSError as e:
         logger.warning('主机名 IPv4 解析失败：%s', e)
@@ -528,7 +1166,21 @@ def get_ip():
     )
 
 
-ip = get_ip()
+def _initial_network_selection():
+    global ip, SELECTED_NETWORK
+    try:
+        ip = get_ip()
+    except Exception as error:
+        ip = os.environ.get('TEACHER_IP', '').strip() or '0.0.0.0'
+        try:
+            SELECTED_NETWORK = ipaddress.ip_network(
+                os.environ.get('TEACHER_NETWORK', '').strip(), strict=False)
+        except ValueError:
+            SELECTED_NETWORK = None
+        logger.warning('导入期网络选择失败，将在 start_network() 重试：%s', error)
+
+
+_initial_network_selection()
 
 
 def get_channel_id():
@@ -544,6 +1196,9 @@ def get_channel_id():
 
 
 CHANNEL_ID = get_channel_id()
+SINGLE_INSTANCE_MUTEX_NAME = (
+    os.environ.get('TEACHER_MUTEX_NAME')
+    or f'Local\\JiYuTeacher-Network-{CHANNEL_ID}')
 SUBMISSION_PORT = app_config.load_submission_port()
 logger.info('文件接收配置：port=%d directory=%s（0 表示仅审批，不监听）',
             SUBMISSION_PORT, SUBMISSION_DIR)
@@ -555,6 +1210,17 @@ def get_env_int(name, default, minimum=0, maximum=0xFFFF):
         value = int(raw, 0)
     except ValueError as e:
         raise ValueError(f'{name} 不是有效整数：{raw}') from e
+    if not minimum <= value <= maximum:
+        raise ValueError(f'{name} 必须在 {minimum} 到 {maximum} 之间')
+    return value
+
+
+def get_env_float(name, default, minimum=0.01, maximum=3600.0):
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        value = float(raw)
+    except ValueError as e:
+        raise ValueError(f'{name} 不是有效浮点数：{raw}') from e
     if not minimum <= value <= maximum:
         raise ValueError(f'{name} 必须在 {minimum} 到 {maximum} 之间')
     return value
@@ -574,6 +1240,16 @@ REMOTE_CONTROL_ENABLED = os.environ.get('TEACHER_ENABLE_REMOTE_CONTROL', '1').st
 VIEW_START_DELAY = get_env_int('TEACHER_VIEW_START_DELAY_MS', 0, 0, 10000) / 1000.0
 VIEW_FAILURE_COOLDOWN = get_env_int('TEACHER_VIEW_COOLDOWN', 60, 5, 3600)
 REMOTE_VIEW_DIR = os.path.join(LOG_DIR, 'teacher_remote_view')
+SOCKET_TIMEOUT = get_env_float('TEACHER_SOCKET_TIMEOUT', 0.5, 0.01, 30.0)
+THREAD_JOIN_TIMEOUT = get_env_float('TEACHER_THREAD_JOIN_TIMEOUT', 2.0, 0.05, 30.0)
+CLASSROOM_JOIN_TIMEOUT = get_env_float('TEACHER_CLASSROOM_JOIN_TIMEOUT', 1.0, 0.05, 30.0)
+REMOTE_VIEW_JOIN_TIMEOUT = get_env_float('TEACHER_REMOTE_VIEW_JOIN_TIMEOUT', 1.0, 0.05, 30.0)
+REMOTE_VIEW_IDLE_TIMEOUT = get_env_float('TEACHER_VIEW_IDLE_TIMEOUT', 30.0, 0.05, 3600.0)
+ANNOUNCE_INFO_CYCLES = get_env_int('TEACHER_ANNOUNCE_INFO_CYCLES', 10, 1, 10000)
+PREVIEW_POLICY_BASE = 3
+PREVIEW_FRAME_TTL = get_env_float('TEACHER_PREVIEW_TTL', 10.0, 0.05, 3600.0)
+PREVIEW_MAX_MISSING_PARTS = 512
+ERROR_ALREADY_EXISTS = 183
 
 
 def get_session_endpoint(channel):
@@ -602,6 +1278,7 @@ def build_announce_targets(group, port):
     # VMware NAT 和仅主机网络都是独立二层网段。组播被虚拟交换
     # 机过滤时，子网广播仍能到达同一 VMnet 的宿主机或其他虚拟机。
     if (SELECTED_NETWORK is not None
+            and ip is not None
             and SELECTED_NETWORK.prefixlen <= 30
             and ipaddress.ip_address(ip).is_private):
         add(SELECTED_NETWORK.broadcast_address)
@@ -619,63 +1296,314 @@ def build_announce_targets(group, port):
 MAIN_ANNOUNCE_TARGETS = build_announce_targets(MCAST, PORT)
 SESSION_ANNOUNCE_TARGETS = build_announce_targets(SMCAST, SPORT)
 
-sock = socket.socket(2, 2)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-sock.bind(('', PORT))
-sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
-                struct.pack('4s4s', socket.inet_aton(MCAST), socket.inet_aton(ip)))
-sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(ip))
-sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 32)
-logger.info('主 socket 就绪：%s:%d', MCAST, PORT)
-
-sock2 = socket.socket(2, 2)
-sock2.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-sock2.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-sock2.bind(('', SPORT))
-sock2.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
-                 struct.pack('4s4s', socket.inet_aton(SMCAST), socket.inet_aton(ip)))
-sock2.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(ip))
-sock2.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 32)
-logger.info('会话 socket 就绪：%s:%d', SMCAST, SPORT)
-
-logger.info('Teacher %s channel=%d started on %s:%d + %s:%d',
-            ip, CHANNEL_ID, MCAST, PORT, SMCAST, SPORT)
-logger.info('发现宣告已启用：NANC（普通频道）+ CANC（自动连接）')
-logger.info('主发现目标：%s', ', '.join(
-    f'{host}:{port}' for host, port in MAIN_ANNOUNCE_TARGETS))
-logger.info('会话发现目标：%s', ', '.join(
-    f'{host}:{port}' for host, port in SESSION_ANNOUNCE_TARGETS))
-if SELECTED_NETWORK is None:
-    logger.warning('未获取到所选网卡的子网掩码，未启用自动子网广播；'
-                   '可设置 TEACHER_NETWORK，例如 192.168.52.0/24')
+def _load_session_state():
+    try:
+        with open(SESSION_STATE_PATH, 'r', encoding='utf-8') as handle:
+            data = json.load(handle)
+        return (max(0, int(data.get('generation', 0))),
+                max(0, int(data.get('oonc_seq', 0))))
+    except (OSError, ValueError, TypeError, AttributeError) as error:
+        logger.debug('[Session] 读取跨重启状态失败 path=%s error=%s',
+                     SESSION_STATE_PATH, error)
+        return 0, 0
 
 
-def send_to_targets(out_sock, packet, targets, label):
-    """向一组宣告目标发送同一数据包，单个目标失败不影响其他目标。"""
-    failures = []
-    sent = 0
-    for target in targets:
+def _write_session_state_locked():
+    data = {
+        'generation': generation,
+        'oonc_seq': oonc_seq,
+        'session_id': session_id,
+        'pid': os.getpid(),
+        'updated_at': time.time(),
+    }
+    directory = os.path.dirname(SESSION_STATE_PATH)
+    temporary = f'{SESSION_STATE_PATH}.{os.getpid()}.tmp'
+    try:
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(temporary, 'w', encoding='utf-8', newline='\n') as handle:
+            json.dump(data, handle, ensure_ascii=False, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, SESSION_STATE_PATH)
+        return True
+    except OSError as error:
         try:
-            out_sock.sendto(packet, target)
+            os.remove(temporary)
+        except OSError:
+            pass
+        # 状态文件只是跨重启顺延用；写失败不能阻断启动或退出。
+        logger.warning('[Session] 保存跨重启状态失败 path=%s error=%s',
+                       SESSION_STATE_PATH, error)
+        return False
+
+
+def _save_session_state():
+    with session_state_lock:
+        return _write_session_state_locked()
+
+
+def _acquire_single_instance_mutex():
+    if os.name != 'nt':
+        return None, True
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL,
+                                         wintypes.LPCWSTR]
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        ctypes.set_last_error(0)
+        handle = kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX_NAME)
+        if not handle:
+            logger.error('[Network] 创建单实例 Mutex 失败 error=%s',
+                         ctypes.get_last_error())
+            return None, False
+        if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(handle)
+            logger.error('[Network] 已有教师端实例持有 Mutex=%s，拒绝重复绑定端口',
+                         SINGLE_INSTANCE_MUTEX_NAME)
+            return None, False
+        return (kernel32, handle), True
+    except Exception as error:
+        logger.error('[Network] 单实例 Mutex 初始化失败：%s', error, exc_info=True)
+        return None, False
+
+
+def _release_single_instance_mutex():
+    global single_instance_mutex, single_instance_locked
+    with network_lock:
+        handle_info = single_instance_mutex
+        single_instance_mutex = None
+        single_instance_locked = False
+    if handle_info is None:
+        return
+    kernel32, handle = handle_info
+    try:
+        kernel32.CloseHandle(handle)
+        logger.info('[Network] 单实例 Mutex 已释放 name=%s',
+                    SINGLE_INSTANCE_MUTEX_NAME)
+    except Exception as error:
+        logger.warning('[Network] 释放单实例 Mutex 失败：%s', error)
+
+
+def _create_network_socket(group, port, bind_ip):
+    network_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    exclusive = getattr(socket, 'SO_EXCLUSIVEADDRUSE', None)
+    exclusive_applied = False
+    if os.name == 'nt' and exclusive is not None:
+        network_socket.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+        exclusive_applied = True
+    else:
+        network_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    network_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    network_socket.bind((bind_ip, port))
+    network_socket.setsockopt(
+        socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+        struct.pack('4s4s', socket.inet_aton(group), socket.inet_aton(bind_ip)))
+    network_socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                              socket.inet_aton(bind_ip))
+    network_socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 32)
+    network_socket.settimeout(SOCKET_TIMEOUT)
+    logger.info('[Network] socket 就绪 bind=%s:%d group=%s:%d timeout=%.2fs exclusive=%s',
+                bind_ip, port, group, port, SOCKET_TIMEOUT, exclusive_applied)
+    return network_socket, exclusive_applied
+
+
+def _close_network_sockets():
+    global sock, sock2, network_sockets_closed, network_started
+    with network_lock:
+        sockets = (sock, sock2)
+        network_sockets_closed = True
+        network_started = False
+        sock = None
+        sock2 = None
+    for network_socket in sockets:
+        if network_socket is None:
+            continue
+        try:
+            network_socket.close()
+        except OSError as error:
+            logger.debug('[Network] socket close 忽略：%s', error)
+    logger.info('[Network] socket 已关闭 main=%s session=%s',
+                sockets[0] is not None, sockets[1] is not None)
+
+
+def _send_packet(out_sock, packet, target, label, allow_when_stopped=False):
+    with network_lock:
+        current_socket = out_sock
+        closed = network_sockets_closed
+        started = network_started
+        stopped = network_stop_event.is_set()
+    if closed or not started or current_socket is None:
+        logger.warning('[Network] socket 不可用，拒绝发送 label=%s target=%s closed=%s started=%s',
+                       label, target, closed, started)
+        return False
+    if stopped and not allow_when_stopped:
+        logger.debug('[Network] 已停止，跳过发送 label=%s target=%s', label, target)
+        return False
+    try:
+        current_socket.sendto(packet, target)
+        return True
+    except OSError as error:
+        logger.error('[Network] 发送失败 label=%s target=%s error=%s',
+                     label, target, error)
+        return False
+
+
+def _send_main(packet, target, label, allow_when_stopped=False):
+    return _send_packet(sock, packet, target, label, allow_when_stopped)
+
+
+def _send_session(packet, target, label, allow_when_stopped=False):
+    return _send_packet(sock2, packet, target, label, allow_when_stopped)
+
+
+def get_network_status():
+    with network_lock:
+        status = {
+            'running': running,
+            'network_started': network_started,
+            'network_sockets_closed': network_sockets_closed,
+            'network_stopped': network_stop_event.is_set(),
+            'ip': ip,
+            'bind_ip': ip,
+            'channel_id': CHANNEL_ID,
+            'main_multicast': f'{MCAST}:{PORT}',
+            'session_multicast': f'{SMCAST}:{SPORT}',
+            'main_targets': list(MAIN_ANNOUNCE_TARGETS),
+            'session_targets': list(SESSION_ANNOUNCE_TARGETS),
+            'selected_network': str(SELECTED_NETWORK) if SELECTED_NETWORK else None,
+            'session_id': session_id,
+            'pid': os.getpid(),
+            'generation': generation,
+            'oonc_seq': oonc_seq,
+            'single_instance_mutex': single_instance_locked,
+            'mutex_name': SINGLE_INSTANCE_MUTEX_NAME,
+            'exclusive_addruse': exclusive_addruse,
+            'socket_timeout': SOCKET_TIMEOUT,
+            'thread_join_timeout': THREAD_JOIN_TIMEOUT,
+            'announce_info_cycles': ANNOUNCE_INFO_CYCLES,
+            'shutdown_stage': shutdown_stage,
+            'session_state_path': SESSION_STATE_PATH,
+            'error': network_error,
+        }
+    with thread_lock:
+        status['threads'] = {
+            name: bool(thread.is_alive())
+            for name, thread in background_threads.items()
+        }
+    status['threads_alive'] = sorted(
+        name for name, alive in status['threads'].items() if alive)
+    return status
+
+
+def start_network():
+    """显式创建/绑定两个 UDP socket；重复调用不会重复绑定。返回 bool。"""
+    global ip, SELECTED_NETWORK, sock, sock2, network_started
+    global network_sockets_closed, network_error, single_instance_mutex
+    global single_instance_locked, exclusive_addruse, session_id
+    global generation, oonc_seq, shutdown_stage
+    with network_lock:
+        if (network_started and not network_sockets_closed
+                and sock is not None and sock2 is not None):
+            logger.debug('[Network] 已启动，幂等返回 session_id=%s', session_id)
+            return True
+        if network_started:
+            _close_network_sockets()
+        # 允许 shutdown 后在同一进程内重启（GUI 重开/测试复用）。
+        shutdown_stage = None
+        mutex_info, mutex_ok = _acquire_single_instance_mutex()
+        if not mutex_ok:
+            network_error = '单实例 Mutex 已被占用或创建失败'
+            return False
+        single_instance_mutex = mutex_info
+        single_instance_locked = True
+        try:
+            ip = get_ip()
+        except Exception as error:
+            network_error = f'选择网络失败：{error}'
+            _release_single_instance_mutex()
+            logger.error('[Network] 选择网络失败：%s', error, exc_info=True)
+            return False
+        MAIN_ANNOUNCE_TARGETS[:] = build_announce_targets(MCAST, PORT)
+        SESSION_ANNOUNCE_TARGETS[:] = build_announce_targets(SMCAST, SPORT)
+        previous_generation, previous_oonc_seq = _load_session_state()
+        with session_state_lock:
+            generation = previous_generation + 1
+            oonc_seq = max(previous_oonc_seq, oonc_seq) + 1
+            session_id = f'{time.time_ns()}-{os.getpid()}-{uuid.uuid4().hex[:8]}'
+            _write_session_state_locked()
+        network_stop_event.clear()
+        network_error = None
+        try:
+            main_socket, exclusive_applied = _create_network_socket(MCAST, PORT, ip)
+            session_socket, _ = _create_network_socket(SMCAST, SPORT, ip)
+        except Exception as error:
+            try:
+                if 'main_socket' in locals():
+                    main_socket.close()
+            except OSError:
+                pass
+            _close_network_sockets()
+            _release_single_instance_mutex()
+            network_error = f'socket 初始化失败：{error}'
+            logger.error('[Network] socket 初始化失败：%s', error, exc_info=True)
+            return False
+        sock, sock2 = main_socket, session_socket
+        exclusive_addruse = exclusive_applied
+        network_sockets_closed = False
+        network_started = True
+        _save_session_state()
+        logger.info('[Network] session_id=%s pid=%d generation=%d oonc_seq=%d '
+                    'ip=%s channel=%d mutex=%s exclusive=%s',
+                    session_id, os.getpid(), generation, oonc_seq, ip, CHANNEL_ID,
+                    SINGLE_INSTANCE_MUTEX_NAME, exclusive_addruse)
+        logger.info('Teacher %s channel=%d started on %s:%d + %s:%d',
+                    ip, CHANNEL_ID, MCAST, PORT, SMCAST, SPORT)
+        logger.info('发现宣告已启用：NANC（普通频道）+ CANC（自动连接）')
+        logger.info('主发现目标：%s', ', '.join(
+            f'{host}:{port}' for host, port in MAIN_ANNOUNCE_TARGETS))
+        logger.info('会话发现目标：%s', ', '.join(
+            f'{host}:{port}' for host, port in SESSION_ANNOUNCE_TARGETS))
+        if SELECTED_NETWORK is None:
+            logger.warning('未获取到所选网卡的子网掩码，未启用自动子网广播；'
+                           '可设置 TEACHER_NETWORK，例如 192.168.52.0/24')
+        return True
+
+
+def send_to_targets(out_sock, packet, targets, label, allow_when_stopped=False):
+    """向一组宣告目标发送同一数据包；返回 (成功数, 失败数)，不抛瞬时错误。"""
+    sent = 0
+    failures = 0
+    if network_stop_event.is_set() and not allow_when_stopped:
+        return 0, 0
+    for target in targets:
+        if network_stop_event.is_set() and not allow_when_stopped:
+            break
+        if _send_packet(out_sock, packet, target, label, allow_when_stopped):
             sent += 1
-        except OSError as e:
-            failures.append(f'{target[0]}:{target[1]}（{e}）')
+        else:
+            failures += 1
     if failures:
-        logger.warning('[%s] 部分目标发送失败：%s', label, '; '.join(failures))
-    if not sent:
-        raise OSError(f'{label} 的全部发送目标均失败')
-    return sent
+        logger.warning('[%s] 发包目标失败 sent=%d failed=%d', label, sent, failures)
+    return sent, failures
 
 
 def oonc():
     global oonc_seq
+    with session_state_lock:
+        oonc_seq += 1
+        seq = oonc_seq
+        if seq % ANNOUNCE_INFO_CYCLES == 0:
+            _write_session_state_locked()
     pkt = (struct.pack('<II', 0x434E4F4F, 0x10000)
            + struct.pack('<I', 16)
            + TGUID.bytes_le
            + socket.inet_aton(ip)
-           + struct.pack('<III', 1, 1, oonc_seq))
-    oonc_seq += 1
+           + struct.pack('<III', 1, 1, seq))
     return pkt
 
 
@@ -723,19 +1651,48 @@ def waca(sip):
 
 
 def request_preview(sip):
-    """通过一次 LPNT 关/开切换，立即请求新的预览帧。"""
-    version = preview_policy_versions.get(sip, 3)
-    stop_version = version + 1
-    start_version = version + 2
-    preview_policy_versions[sip] = start_version
-    try:
-        sock.sendto(build_lpnt(stop_version, False), (sip, PORT))
-        time.sleep(0.05)
-        sock.sendto(build_lpnt(start_version, True), (sip, PORT))
-        logger.info('[Preview] LPNT restart -> %s, versions=%d/%d',
-                    sip, stop_version, start_version)
-    except Exception as e:
-        logger.error('[Preview] LPNT restart 发送给 %s 失败：%s', sip, e, exc_info=True)
+    """提交一次 LPNT 策略变更；不是立即截图命令，版本从统一状态单调递增。"""
+    with state_lock:
+        previews.pop(sip, None)
+        completed_preview_frames.pop(sip, None)
+        preview_last_errors.pop(sip, None)
+    ok = _send_preview_policy(sip, True, 'PolicyChange', count=2)
+    _ensure_preview_keepalive(sip)
+    logger.info('[Preview] 策略变更 -> %s ok=%s version=%d；等待同版本 TRNT 与定时器出帧',
+                sip, ok, preview_policy_versions.get(sip, PREVIEW_POLICY_BASE))
+    return ok
+
+
+def request_all_previews():
+    """后台非阻塞地向当前快照内所有学生请求预览；返回是否成功调度。"""
+    targets = [item['ip'] for item in get_students_snapshot()]
+    if not targets:
+        logger.info('[Preview] 全班请求跳过：当前无学生快照')
+        return False
+    if not network_started or network_sockets_closed:
+        logger.warning('[Preview] 全班请求失败：网络尚未启动')
+        return False
+    if not running or network_stop_event.is_set():
+        logger.warning('[Preview] 全班请求失败：后台线程未运行或正在退出')
+        return False
+
+    def worker():
+        sent = 0
+        for student_ip in targets:
+            if not running or network_stop_event.is_set():
+                break
+            if request_preview(student_ip):
+                sent += 1
+            if _sleep_or_stop(0.05):
+                break
+        logger.info('[Preview] 全班请求完成 requested=%d sent=%d',
+                    len(targets), sent)
+
+    thread = _start_managed_thread('request-all-previews', worker)
+    if thread is None:
+        return False
+    logger.info('[Preview] 全班请求已提交后台线程 targets=%d', len(targets))
+    return True
 
 
 def build_mess_packet(sip, payload):
@@ -797,10 +1754,13 @@ def send_remote_view_feature(sip, enabled=True):
     payload = (build_remote_view_payload(sip) if enabled
                else build_remote_view_stop_payload())
     packet = build_mess_packet(sip, payload)
-    sock2.sendto(packet, (sip, SPORT))
-    logger.info('[RemoteView] feature %s -> %s:%d, payload=%d, mess=%d',
+    ok = _send_session(packet, (sip, SPORT),
+                       f'RemoteView feature {"start" if enabled else "stop"}',
+                       allow_when_stopped=True)
+    logger.info('[RemoteView] feature %s -> %s:%d, payload=%d, mess=%d, ok=%s',
                 'start' if enabled else 'stop', sip, SPORT,
-                len(payload), len(packet))
+                len(payload), len(packet), ok)
+    return ok
 
 
 def build_screen_broadcast_payload(sip):
@@ -817,20 +1777,24 @@ def start_screen_broadcast(sip):
     if not _check_student(sip, 'broadcast <学生IP>'):
         return False
     payload = build_screen_broadcast_payload(sip)
-    sock2.sendto(build_mess_packet(sip, payload), (sip, SPORT))
-    screen_broadcasts[sip] = {'started_at': time.time(), 'streaming': False}
-    logger.info('[Broadcast] feature 1 启动包已发送 -> %s；等待媒体推流实现', sip)
-    return True
+    ok = _send_session(build_mess_packet(sip, payload), (sip, SPORT),
+                       'Broadcast feature 1 start')
+    if ok:
+        screen_broadcasts[sip] = {'started_at': time.time(), 'streaming': False}
+    logger.info('[Broadcast] feature 1 启动包 -> %s ok=%s；等待媒体推流实现', sip, ok)
+    return ok
 
 
 def stop_screen_broadcast(sip):
     if not _check_student(sip, 'broadcast_stop <学生IP>'):
         return False
-    sock2.sendto(build_mess_packet(sip, struct.pack('<III', 13, 1, 0) + b'\x00'),
-                 (sip, SPORT))
-    screen_broadcasts.pop(sip, None)
-    logger.info('[Broadcast] feature 1 停止包已发送 -> %s', sip)
-    return True
+    packet = build_mess_packet(sip, struct.pack('<III', 13, 1, 0) + b'\x00')
+    ok = _send_session(packet, (sip, SPORT), 'Broadcast feature 1 stop',
+                       allow_when_stopped=True)
+    if ok:
+        screen_broadcasts.pop(sip, None)
+    logger.info('[Broadcast] feature 1 停止包 -> %s ok=%s', sip, ok)
+    return ok
 
 
 def build_student_demo_payload(port):
@@ -859,12 +1823,15 @@ def start_student_demo(source_ip, port=None):
     if source_ip in screen_broadcasts:
         raise ValueError('请先停止该学生的教师屏幕广播')
     payload = build_student_demo_payload(port)
-    sock2.sendto(build_mess_packet(source_ip, payload), (source_ip, SPORT))
-    student_demos[source_ip] = {'recipients': [source_ip], 'monitoring': False,
-                                'port': port, 'started_at': time.time(), 'scope': 'voice-control'}
-    logger.info('[Demo] feature 4 语音启动控制 -> %s port=%d；屏幕分发与监看尚未实现',
-                source_ip, port)
-    return True
+    ok = _send_session(build_mess_packet(source_ip, payload),
+                       (source_ip, SPORT), 'Demo feature 4 start')
+    if ok:
+        student_demos[source_ip] = {
+            'recipients': [source_ip], 'monitoring': False,
+            'port': port, 'started_at': time.time(), 'scope': 'voice-control'}
+    logger.info('[Demo] feature 4 语音启动控制 -> %s port=%d ok=%s；屏幕分发与监看尚未实现',
+                source_ip, port, ok)
+    return ok
 
 
 def stop_student_demo(source_ip=None):
@@ -876,14 +1843,15 @@ def stop_student_demo(source_ip=None):
     if state is None:
         raise ValueError('该学生没有进行中的演示')
     payload = struct.pack('<IIIIIII', 29, 1, 0, 0, 0, 4, 0x10000000) + b'\x00'
-    errors = []
+    failed = []
     for recipient in state['recipients']:
-        try:
-            sock2.sendto(build_mess_packet(recipient, payload), (recipient, SPORT))
-        except OSError as error:
-            errors.append((recipient, error))
-    if errors:
-        raise OSError(f'演示停止包发送失败：{errors}')
+        if not _send_session(build_mess_packet(recipient, payload),
+                             (recipient, SPORT), 'Demo feature 4 stop',
+                             allow_when_stopped=True):
+            failed.append(recipient)
+    if failed:
+        logger.error('[Demo] feature 4 停止包发送失败 recipients=%s', failed)
+        return False
     student_demos.pop(source_ip, None)
     logger.info('[Demo] feature 4 语音停止控制已发送 source=%s recipients=%s',
                 source_ip, state['recipients'])
@@ -902,10 +1870,12 @@ class RemoteViewSession:
     def __init__(self, sip, port):
         self.sip = sip
         self.port = port
+        self.base_name = sip.replace('.', '_')
         self.stop_event = threading.Event()
         self.connected_event = threading.Event()
         self.conn = None
         self.thread = None
+        self.thread_name = f'view-{self.base_name}-{id(self):x}'
         self.fragments = {}
         self.frame_count = 0
         self.control_record_count = 0
@@ -923,14 +1893,11 @@ class RemoteViewSession:
         self.player_unavailable = False
         self.interactive_requested = False
         self.dump_stream = os.environ.get('TEACHER_VIEW_DUMP', '0').strip() == '1'
-        self.base_name = sip.replace('.', '_')
         self.session_tag = time.strftime('%Y%m%d-%H%M%S')
 
     def start(self):
-        self.thread = threading.Thread(
-            target=self.run, name=f'view-{self.base_name}', daemon=True
-        )
-        self.thread.start()
+        self.thread = _start_managed_thread(self.thread_name, self.run)
+        return self.thread is not None
 
     def stop(self):
         self.stop_event.set()
@@ -938,13 +1905,16 @@ class RemoteViewSession:
         if conn is not None:
             try:
                 conn.shutdown(socket.SHUT_RDWR)
-            except OSError:
+            except (OSError, AttributeError):
                 pass
             try:
                 conn.close()
-            except OSError:
+            except (OSError, AttributeError):
                 pass
+            self.conn = None
         self._stop_player()
+        _join_thread(self.thread, REMOTE_VIEW_JOIN_TIMEOUT)
+        _join_thread(self.viewer_thread, REMOTE_VIEW_JOIN_TIMEOUT)
 
     def enable_interactive_player(self):
         """立即退出纯播放窗口，下一帧改用带输入绑定的内嵌窗口。"""
@@ -967,11 +1937,15 @@ class RemoteViewSession:
             self.connected_event.set()
             with remote_state_lock:
                 remote_view_failures.pop(self.sip, None)
+                remote_view_last_error.pop(self.sip, None)
             logger.info('[RemoteView] TCP 已连接 %s:%d，SHCO channel=%d',
                         self.sip, self.port, self.DESK_CHANNEL)
             return conn
-        except OSError:
+        except OSError as error:
             conn.close()
+            with remote_state_lock:
+                remote_view_failures[self.sip] = time.monotonic()
+                remote_view_last_error[self.sip] = f'TCP 连接失败：{error}'
             raise
 
     def run(self):
@@ -981,13 +1955,22 @@ class RemoteViewSession:
                 return
             conn = self._connect()
             stream = bytearray()
-            while running and not self.stop_event.is_set():
+            last_data_at = time.monotonic()
+            while (running and not self.stop_event.is_set()
+                   and not network_stop_event.is_set()):
                 try:
                     chunk = conn.recv(65536)
                 except socket.timeout:
+                    if (time.monotonic() - last_data_at
+                            > REMOTE_VIEW_IDLE_TIMEOUT):
+                        raise TimeoutError(
+                            f'{REMOTE_VIEW_IDLE_TIMEOUT:.2f}s 内未收到桌面数据')
+                    if self.stop_event.is_set() or network_stop_event.is_set():
+                        break
                     continue
                 if not chunk:
                     raise ConnectionError('学生端关闭 TCP 连接')
+                last_data_at = time.monotonic()
                 stream.extend(chunk)
                 while len(stream) >= 12:
                     version, magic, payload_len = struct.unpack_from('<III', stream)
@@ -1014,19 +1997,13 @@ class RemoteViewSession:
                     else:
                         logger.debug('[RemoteView] 忽略 channel=%d len=%d',
                                      channel, len(payload) - 4)
-        except Exception as e:
+        except Exception as error:
             if not self.stop_event.is_set():
-                with remote_state_lock:
-                    remote_view_failures[self.sip] = time.monotonic()
-                logger.error('[RemoteView] %s 接收结束：%s', self.sip, e,
-                             exc_info=True)
-                print(f'[观看] {self.sip} 接收失败：{e}')
-                print(f'[观看] 已停止请求；{VIEW_FAILURE_COOLDOWN} 秒内不会再次启动，避免学生端反复闪退')
-                try:
-                    send_remote_view_feature(self.sip, False)
-                except OSError as stop_error:
-                    logger.warning('[RemoteView] 向 %s 发送失败清理包失败：%s',
-                                   self.sip, stop_error)
+                reason = f'接收结束：{error}'
+                _set_view_error(self.sip, reason)
+                logger.error('[RemoteView] %s %s', self.sip, reason, exc_info=True)
+                if not send_remote_view_feature(self.sip, False):
+                    logger.warning('[RemoteView] %s 失败清理包未送达', self.sip)
         finally:
             self.stop()
             with remote_state_lock:
@@ -1682,48 +2659,101 @@ def probe_remote_view(sip, port=TCP_COMM_PORT, timeout=1.5):
         probe.close()
 
 
-def start_remote_view(sip, port=TCP_COMM_PORT):
+def start_remote_view(sip, port=TCP_COMM_PORT, probe=False):
+    if not network_started or not running:
+        reason = '网络尚未启动或后台线程未运行'
+        _set_view_error(sip, reason)
+        logger.warning('[RemoteView] 拒绝启动 %s：%s', sip, reason)
+        return False
     if not _check_student(sip, 'view <学生IP> [TCP端口]'):
+        _set_view_error(sip, '学生未登录或不在快照中')
         return False
     with remote_state_lock:
         failure_time = remote_view_failures.get(sip)
         if failure_time is not None:
             remaining = VIEW_FAILURE_COOLDOWN - (time.monotonic() - failure_time)
             if remaining > 0:
-                print(f'[观看] {sip} 仍在失败冷却中，请等待 {int(remaining) + 1} 秒；不要连续执行 view')
+                reason = f'失败冷却中，剩余 {remaining:.1f} 秒'
+                _set_view_error(sip, reason)
+                logger.warning('[RemoteView] 拒绝启动 %s：%s', sip, reason)
                 return False
             remote_view_failures.pop(sip, None)
         if remote_views.get(sip):
-            print(f'[观看] {sip} 已有观看会话；如需重启请先执行 view_stop {sip}')
+            reason = '已有观看会话'
+            _set_view_error(sip, reason)
+            logger.warning('[RemoteView] 拒绝启动 %s：%s', sip, reason)
             return False
-    reachable, detail = probe_remote_view(sip, port)
-    if not reachable:
-        print(f'[观看] 未启动：{sip}:{port} 未监听（{detail}）。请先确认学生端已重新登录，再执行 view_probe')
-        return False
+    if probe:
+        reachable, detail = probe_remote_view(sip, port)
+        if not reachable:
+            reason = f'TCP 探测失败：{detail}'
+            _set_view_error(sip, reason)
+            logger.warning('[RemoteView] 拒绝启动 %s：%s', sip, reason)
+            return False
     with remote_state_lock:
         session = RemoteViewSession(sip, port)
         remote_views[sip] = session
-    try:
-        send_remote_view_feature(sip, True)
-    except Exception:
+    if not send_remote_view_feature(sip, True):
         with remote_state_lock:
             if remote_views.get(sip) is session:
                 remote_views.pop(sip, None)
             remote_view_failures[sip] = time.monotonic()
+            remote_view_last_error[sip] = 'feature start 发送失败'
         session.stop()
-        raise
-    session.start()
+        return False
+    if not session.start():
+        with remote_state_lock:
+            if remote_views.get(sip) is session:
+                remote_views.pop(sip, None)
+            remote_view_failures[sip] = time.monotonic()
+            remote_view_last_error[sip] = '观看线程启动失败'
+        session.stop()
+        send_remote_view_feature(sip, False)
+        return False
+    with remote_state_lock:
+        remote_view_last_error.pop(sip, None)
+    logger.info('[RemoteView] 已启动 %s:%d（未做 connect+close 探测）', sip, port)
     return True
 
 
 def stop_remote_view(sip, notify=True):
     with remote_state_lock:
         session = remote_views.pop(sip, None)
-    if session:
-        session.stop()
+        remote_view_failures.pop(sip, None)
+        remote_view_last_error.pop(sip, None)
+    if session is not None:
+        try:
+            session.stop()
+        except Exception as error:
+            logger.warning('[RemoteView] 停止本地会话失败 %s：%s', sip, error)
+    ok = True
     if notify:
-        send_remote_view_feature(sip, False)
-    logger.info('[RemoteView] stop -> %s（本地会话=%s）', sip, bool(session))
+        ok = send_remote_view_feature(sip, False)
+    logger.info('[RemoteView] stop -> %s（本地会话=%s，notify=%s，ok=%s）',
+                sip, session is not None, notify, ok)
+    return ok
+
+
+def toggle_remote_view(sip, port=TCP_COMM_PORT, probe=False):
+    state = get_view_state(sip)
+    if state['active']:
+        ok = stop_remote_view(sip, notify=True)
+        return {
+            'ok': ok,
+            'active': get_view_state(sip)['active'],
+            'action': 'stopped',
+            'reason': None if ok else '停止包未送达',
+            'cooldown_remaining': 0.0,
+        }
+    ok = start_remote_view(sip, port, probe=probe)
+    state = get_view_state(sip)
+    return {
+        'ok': ok,
+        'active': state['active'],
+        'action': 'started' if ok else 'start',
+        'reason': None if ok else state['reason'],
+        'cooldown_remaining': state['cooldown_remaining'],
+    }
 
 
 def build_remote_control_payload(sip, mode, port):
@@ -1746,14 +2776,14 @@ def choose_remote_control_port():
 
 def start_remote_control(sip, port=None):
     if not REMOTE_CONTROL_ENABLED:
-        print('[远控] 已禁用；删除 TEACHER_ENABLE_REMOTE_CONTROL=0 后重启脚本即可启用')
+        logger.warning('[RemoteControl] 已禁用，拒绝启动 %s', sip)
         return False
     if not _check_student(sip, 'control <学生IP> [UDP端口]'):
         return False
     with remote_state_lock:
         session = remote_views.get(sip)
     if session is None or not session.connected_event.is_set():
-        print('[远控] 未发送 MCMD：屏幕 TCP 通道尚未连接')
+        logger.warning('[RemoteControl] 未发送 MCMD：%s 屏幕 TCP 通道尚未连接', sip)
         return False
     if port is None:
         port = choose_remote_control_port()
@@ -1771,14 +2801,25 @@ def start_remote_control(sip, port=None):
     with remote_state_lock:
         old = remote_controls.pop(sip, None)
         if old:
-            old['sock'].close()
+            try:
+                old['sock'].close()
+            except OSError:
+                pass
         remote_controls[sip] = {
             'port': port,
             'sock': sender,
             'input_count': 0,
             'ready_at': time.monotonic() + 0.35,
         }
-    sock.sendto(packet, (sip, PORT))
+    if not _send_main(packet, (sip, PORT), 'RemoteControl MCMD start'):
+        with remote_state_lock:
+            if remote_controls.get(sip, {}).get('sock') is sender:
+                remote_controls.pop(sip, None)
+        try:
+            sender.close()
+        except OSError:
+            pass
+        return False
     mode_name = 'Share' if mode == 0 else 'Control Student'
     logger.info('[RemoteControl] COMD/MCMD mode=%d (%s) -> %s:%d，输入端点=%s:%d',
                 mode, mode_name, sip, PORT, sip, port)
@@ -1790,12 +2831,19 @@ def stop_remote_control(sip, notify=True):
         state = remote_controls.pop(sip, None)
     port = state['port'] if state else (CONTROL_PORT or 0)
     if state:
-        state['sock'].close()
+        try:
+            state['sock'].close()
+        except OSError as error:
+            logger.debug('[RemoteControl] 关闭输入 socket 忽略：%s', error)
+    ok = True
     if notify:
         packet = build_command_transaction(
             build_remote_control_payload(sip, 1, port))
-        sock.sendto(packet, (sip, PORT))
-    logger.info('[RemoteControl] stop -> %s:%d', sip, port)
+        ok = _send_main(packet, (sip, PORT), 'RemoteControl MCMD stop',
+                        allow_when_stopped=True)
+    logger.info('[RemoteControl] stop -> %s:%d notify=%s ok=%s',
+                sip, port, notify, ok)
+    return ok
 
 
 def send_remote_input(sip, kind, payload):
@@ -1804,13 +2852,18 @@ def send_remote_input(sip, kind, payload):
     with remote_state_lock:
         state = remote_controls.get(sip)
     if not state:
-        print(f'[远控] {sip} 尚未 control，请先执行 control {sip}')
+        logger.warning('[RemoteControl] %s 尚未 control，忽略输入', sip)
         return False
     startup_delay = state['ready_at'] - time.monotonic()
     if startup_delay > 0:
         time.sleep(startup_delay)
     packet = struct.pack('<II', 0x2321347C, kind) + payload
-    state['sock'].sendto(packet, (sip, state['port']))
+    try:
+        state['sock'].sendto(packet, (sip, state['port']))
+    except OSError as error:
+        logger.error('[RemoteControl] input 发送失败 -> %s:%d error=%s',
+                     sip, state['port'], error)
+        return False
     with remote_state_lock:
         state['input_count'] += 1
         input_count = state['input_count']
@@ -1869,8 +2922,8 @@ def send_remote_key(sip, virtual_key, key_up=False, scan_code=None,
 def send_chat(sip, text):
     """向已登录学生发送聊天消息（MESS，payload type=0x800）。"""
     if sip not in students:
-        print(f'[命令] 学生 {sip} 未登录')
-        return
+        logger.warning('[命令] 学生 %s 未登录，拒绝发送聊天消息', sip)
+        return False
     try:
         text_utf16 = text.encode('utf-16-le') + b'\x00\x00'
         # [12..15] 经测试应设为 UTF-16 码元数（含结尾空字符），否则学生端可能只显示第一个字。
@@ -1884,12 +2937,12 @@ def send_chat(sip, text):
                 + struct.pack('<I', 1)
                 + socket.inet_aton(sip)
                 + payload)
-        sock2.sendto(mess, (sip, SPORT))
-        logger.info('[命令] 发送聊天消息 -> %s: %s', sip, text)
-        print(f'[命令] 聊天消息已发送给 {sip}')
-    except Exception as e:
-        logger.error('[命令] 发送聊天消息失败：%s', e, exc_info=True)
-        print(f'[命令] 发送失败：{e}')
+        ok = _send_session(mess, (sip, SPORT), 'Chat MESS')
+        logger.info('[命令] 发送聊天消息 -> %s: %s ok=%s', sip, text, ok)
+        return ok
+    except Exception as error:
+        logger.error('[命令] 发送聊天消息失败：%s', error, exc_info=True)
+        return False
 
 
 def request_info(sip, rtype=0):
@@ -1902,8 +2955,8 @@ def request_info(sip, rtype=0):
     学生端入口: sub_44CA70 [payload+4]==0x100000 → sub_445670。
     """
     if sip not in students:
-        print(f'[命令] 学生 {sip} 未登录')
-        return
+        logger.warning('[Info] 学生 %s 未登录，拒绝请求信息', sip)
+        return False
     try:
         payload = (struct.pack('<I', 16)
                    + struct.pack('<I', 0x100000)
@@ -1913,11 +2966,12 @@ def request_info(sip, rtype=0):
                 + struct.pack('<I', 1)
                 + socket.inet_aton(sip)
                 + payload)
-        sock2.sendto(mess, (sip, SPORT))
-        logger.info('[Info] 信息请求 rtype=%d -> %s:%d', rtype, sip, SPORT)
-    except Exception as e:
-        logger.error('[Info] 发送信息请求失败：%s', e, exc_info=True)
-        print(f'[命令] 发送失败：{e}')
+        ok = _send_session(mess, (sip, SPORT), 'Info MESS')
+        logger.info('[Info] 信息请求 rtype=%d -> %s:%d ok=%s', rtype, sip, SPORT, ok)
+        return ok
+    except Exception as error:
+        logger.error('[Info] 发送信息请求失败：%s', error, exc_info=True)
+        return False
 
 
 def send_kill(sip, pid=None, hwnd=None, force=1):
@@ -1928,26 +2982,26 @@ def send_kill(sip, pid=None, hwnd=None, force=1):
     学生端 fire-and-forget 无确认包；杀完重新 info 刷新列表验证结果。
     """
     if sip not in students:
-        print(f'[命令] 学生 {sip} 未登录')
-        return
+        logger.warning('[命令] 学生 %s 未登录，拒绝结束命令', sip)
+        return False
     if pid is None and hwnd is None:
-        print('[命令] 需要 pid 或 hwnd')
-        return
-    rtype = 4 if pid is not None else 3
-    payload = (struct.pack('<I', 24) + struct.pack('<I', 0x100000)
-               + struct.pack('<I', 0) + struct.pack('<I', rtype)
-               + struct.pack('<I', hwnd or 0) + struct.pack('<I', pid or 0)
-               + struct.pack('<I', force))
-    mess = (struct.pack('<II', 0x5353454D, 1) + struct.pack('<I', 1)
-            + socket.inet_aton(sip) + payload)
-    kind = f'进程 pid={pid}' if rtype == 4 else f'应用窗口 hwnd=0x{hwnd:08X}'
+        logger.warning('[命令] 需要 pid 或 hwnd')
+        return False
     try:
-        sock2.sendto(mess, (sip, SPORT))
-        logger.info('[命令] 结束%s -> %s, force=%d', kind, sip, force)
-        print(f'[命令] 已向 {sip} 发送结束{kind}(force={force})')
-    except Exception as e:
-        logger.error('[命令] 发送结束命令失败：%s', e, exc_info=True)
-        print(f'[命令] 发送失败：{e}')
+        rtype = 4 if pid is not None else 3
+        payload = (struct.pack('<I', 24) + struct.pack('<I', 0x100000)
+                   + struct.pack('<I', 0) + struct.pack('<I', rtype)
+                   + struct.pack('<I', hwnd or 0) + struct.pack('<I', pid or 0)
+                   + struct.pack('<I', force))
+        mess = (struct.pack('<II', 0x5353454D, 1) + struct.pack('<I', 1)
+                + socket.inet_aton(sip) + payload)
+        kind = f'进程 pid={pid}' if rtype == 4 else f'应用窗口 hwnd=0x{hwnd:08X}'
+        ok = _send_session(mess, (sip, SPORT), 'Kill MESS')
+        logger.info('[命令] 结束%s -> %s force=%d ok=%s', kind, sip, force, ok)
+        return ok
+    except Exception as error:
+        logger.error('[命令] 发送结束命令失败：%s', error, exc_info=True)
+        return False
 
 
 def send_open_url(sip, url):
@@ -1957,21 +3011,21 @@ def send_open_url(sip, url):
     也可以传学生机上的文件路径，按扩展名关联程序打开（.txt/.jpg 等）。
     """
     if sip not in students:
-        print(f'[命令] 学生 {sip} 未登录')
-        return
-    payload = (struct.pack('<I', 0x200) + struct.pack('<I', 0)
-               + struct.pack('<I', 0x18) + struct.pack('<I', 0)
-               + url.encode('utf-16-le') + b'\x00\x00'
-               + b'\x00' * 4)
-    pkt = build_comd_command_ex(0x80000010, payload,
-                                'f96a6d195b2946b9ab958a143ecddc26')
+        logger.warning('[命令] 学生 %s 未登录，拒绝打开命令', sip)
+        return False
     try:
-        sock.sendto(pkt, (sip, PORT))
-        logger.info('[命令] 打开网页/文件 -> %s: %s', sip, url)
-        print(f'[命令] 已向 {sip} 发送打开命令：{url}')
-    except Exception as e:
-        logger.error('[命令] 发送打开命令失败：%s', e, exc_info=True)
-        print(f'[命令] 发送失败：{e}')
+        payload = (struct.pack('<I', 0x200) + struct.pack('<I', 0)
+                   + struct.pack('<I', 0x18) + struct.pack('<I', 0)
+                   + url.encode('utf-16-le') + b'\x00\x00'
+                   + b'\x00' * 4)
+        pkt = build_comd_command_ex(0x80000010, payload,
+                                    'f96a6d195b2946b9ab958a143ecddc26')
+        ok = _send_main(pkt, (sip, PORT), 'OpenURL COMD')
+        logger.info('[命令] 打开网页/文件 -> %s: %s ok=%s', sip, url, ok)
+        return ok
+    except Exception as error:
+        logger.error('[命令] 发送打开命令失败：%s', error, exc_info=True)
+        return False
 
 
 def send_run_program(sip, path, args='', show=0, fallback=1):
@@ -1982,23 +3036,24 @@ def send_run_program(sip, path, args='', show=0, fallback=1):
     fallback=1 时启动失败会在系统目录查找同名程序重试一次。
     """
     if sip not in students:
-        print(f'[命令] 学生 {sip} 未登录')
-        return
-    body = struct.pack('<I', 0x0F) + struct.pack('<I', fallback)
-    body += path.encode('utf-16-le')[:510].ljust(512, b'\x00')   # a2+8  路径 256 wchar
-    body += args.encode('utf-16-le')[:318].ljust(320, b'\x00')   # a2+520 参数 160 wchar
-    body += struct.pack('<I', show)                                 # a2+840 窗口模式
-    payload = (struct.pack('<I', 0x200) + struct.pack('<I', 0)
-               + body + b'\x00' * 4)
-    pkt = build_comd_command_ex(0x80000010, payload,
-                                'f96a6d195b2946b9ab958a143ecddc26')
+        logger.warning('[命令] 学生 %s 未登录，拒绝运行命令', sip)
+        return False
     try:
-        sock.sendto(pkt, (sip, PORT))
-        logger.info('[命令] 远程运行 -> %s: "%s" %s (show=%d)', sip, path, args, show)
-        print(f'[命令] 已向 {sip} 发送运行命令："{path}" {args}')
-    except Exception as e:
-        logger.error('[命令] 发送运行命令失败：%s', e, exc_info=True)
-        print(f'[命令] 发送失败：{e}')
+        body = struct.pack('<I', 0x0F) + struct.pack('<I', fallback)
+        body += path.encode('utf-16-le')[:510].ljust(512, b'\x00')
+        body += args.encode('utf-16-le')[:318].ljust(320, b'\x00')
+        body += struct.pack('<I', show)
+        payload = (struct.pack('<I', 0x200) + struct.pack('<I', 0)
+                   + body + b'\x00' * 4)
+        pkt = build_comd_command_ex(0x80000010, payload,
+                                    'f96a6d195b2946b9ab958a143ecddc26')
+        ok = _send_main(pkt, (sip, PORT), 'RunProgram COMD')
+        logger.info('[命令] 远程运行 -> %s: "%s" %s show=%d ok=%s',
+                    sip, path, args, show, ok)
+        return ok
+    except Exception as error:
+        logger.error('[命令] 发送运行命令失败：%s', error, exc_info=True)
+        return False
 
 
 def _parse_id_name_pairs(buf):
@@ -2150,9 +3205,10 @@ def _send_comd_blackscreen_lock(sip, timeout=10):
     payload += struct.pack('<I', 0)            # has_text
     payload += b'\x00' * 8                    # padding
     pkt = build_comd_command_ex(0x80000010, payload, 'f96a6d195b2946b9ab958a143ecddc26')
-    sock.sendto(pkt, (sip, PORT))
-    logger.info('[锁键鼠] COMD case6 lock=1 timer_flag=1 timeout=%d -> %s:%d',
-                timeout, sip, PORT)
+    ok = _send_main(pkt, (sip, PORT), 'BlackScreen COMD case6')
+    logger.info('[锁键鼠] COMD case6 lock=1 timer_flag=1 timeout=%d -> %s:%d ok=%s',
+                timeout, sip, PORT, ok)
+    return ok
 
 
 def send_blackscreen(sip, lock_input=True, timeout=10, text=None):
@@ -2166,41 +3222,34 @@ def send_blackscreen(sip, lock_input=True, timeout=10, text=None):
     时间到再发 flags=0x90000000（解）。
     """
     if sip not in students:
-        print(f'[命令] 学生 {sip} 未登录')
-        return
+        logger.warning('[命令] 学生 %s 未登录，拒绝黑屏命令', sip)
+        return False
     try:
-        # 1) MESS 黑屏包 → 组播（创建窗口、设置 bit 0x20，并按 lock_input 锁键鼠）
         payload = build_blackscreen_mess_payload(lock_input, timeout, text)
         mess = (struct.pack('<II', 0x5353454D, 1)
                 + struct.pack('<I', 1)
                 + socket.inet_aton(sip)
                 + payload)
-        sock2.sendto(mess, (SMCAST, SPORT))
-
-        # 2) COMD case 6 → 单播兼容补包；不启用学生端本地定时器
+        ok = _send_session(mess, (SMCAST, SPORT), 'BlackScreen MESS')
         if lock_input:
-            _send_comd_blackscreen_lock(sip, timeout=timeout)
-
-        # 取消之前的定时器
+            ok = _send_comd_blackscreen_lock(sip, timeout=timeout) and ok
         if sip in blackscreen_timers:
             blackscreen_timers[sip].cancel()
             del blackscreen_timers[sip]
-
         if timeout > 0:
             timeout_str = f'{timeout}秒后自动解锁'
-            t = threading.Timer(timeout, _auto_unlock, args=(sip,))
-            t.daemon = True
-            t.start()
-            blackscreen_timers[sip] = t
+            timer = threading.Timer(timeout, _auto_unlock, args=(sip,))
+            timer.daemon = True
+            timer.start()
+            blackscreen_timers[sip] = timer
         else:
             timeout_str = '永久（需手动 unlock）'
-
-        logger.info('[命令] 黑屏安静 -> %s, lock=%s, timeout=%s, text=%s',
-                    sip, lock_input, timeout_str, text)
-        print(f'[命令] 已向 {sip} 发送黑屏安静（{timeout_str}）')
-    except Exception as e:
-        logger.error('[命令] 发送黑屏安静失败：%s', e, exc_info=True)
-        print(f'[命令] 发送失败：{e}')
+        logger.info('[命令] 黑屏安静 -> %s lock=%s timeout=%s text=%s ok=%s',
+                    sip, lock_input, timeout_str, text, ok)
+        return ok
+    except Exception as error:
+        logger.error('[命令] 发送黑屏安静失败：%s', error, exc_info=True)
+        return False
 
 
 def _auto_unlock(sip):
@@ -2209,16 +3258,14 @@ def _auto_unlock(sip):
         del blackscreen_timers[sip]
     if sip in students:
         logger.info('[AutoUnlock] 超时自动解锁 %s', sip)
-        print(f'[自动] {sip} 黑屏超时，正在解锁...')
-        _do_unlock(sip)
-    else:
-        logger.info('[AutoUnlock] %s 已下线，跳过', sip)
+        return _do_unlock(sip)
+    logger.info('[AutoUnlock] %s 已下线，跳过', sip)
+    return False
 
 
 def _do_unlock(sip):
     """通过 MESS 停止标志关闭黑屏并解除键鼠锁。"""
     try:
-        # MESS 解锁 → 组播（flags=0x90000000，清除 bit 0x20）
         payload = (struct.pack('<I', 0x0D)
                    + struct.pack('<I', 0x20)
                    + struct.pack('<I', 0x90000000)
@@ -2227,23 +3274,26 @@ def _do_unlock(sip):
                 + struct.pack('<I', 1)
                 + socket.inet_aton(sip)
                 + payload)
-        sock2.sendto(mess, (SMCAST, SPORT))
-        logger.info('[解锁] MESS -> %s:%d 目标=%s', SMCAST, SPORT, sip)
-    except Exception as e:
-        logger.error('[解锁] 发送失败：%s', e, exc_info=True)
+        ok = _send_session(mess, (SMCAST, SPORT), 'Unblack MESS',
+                           allow_when_stopped=True)
+        logger.info('[解锁] MESS -> %s:%d 目标=%s ok=%s', SMCAST, SPORT, sip, ok)
+        return ok
+    except Exception as error:
+        logger.error('[解锁] 发送失败：%s', error, exc_info=True)
+        return False
 
 
 def send_unlock(sip):
     """向已登录学生发送 MESS 黑屏停止/解锁命令。"""
     if sip not in students:
-        print(f'[命令] 学生 {sip} 未登录')
-        return
-    # 取消自动解锁定时器
+        logger.warning('[命令] 学生 %s 未登录，拒绝解锁', sip)
+        return False
     if sip in blackscreen_timers:
         blackscreen_timers[sip].cancel()
         del blackscreen_timers[sip]
-    _do_unlock(sip)
-    print(f'[命令] 已向 {sip} 发送解锁')
+    ok = _do_unlock(sip)
+    logger.info('[命令] 解锁 -> %s ok=%s', sip, ok)
+    return ok
 
 
 def send_shutdown(sip, reboot=False, delay=0, force=True, text=None):
@@ -2258,29 +3308,29 @@ def send_shutdown(sip, reboot=False, delay=0, force=True, text=None):
     会从 reserved 字段开始算，吃掉 payload 尾部 4 字节。
     """
     if sip not in students:
-        print(f'[命令] 学生 {sip} 未登录')
-        return
-    cmd = (0x13 if reboot else 0x14) | (0x10000000 if force else 0)
-    payload = struct.pack('<I', 0x200)                # category: 应用命令
-    payload += struct.pack('<I', 0)                   # flags
-    payload += struct.pack('<I', cmd)                 # cmdId
-    payload += struct.pack('<I', delay)               # 延迟秒数
-    payload += b'\x00' * 8                            # reserved
-    if text:
-        payload += text.encode('utf-16-le') + b'\x00\x00'
-    payload += b'\x00' * 4                            # 吸收接收端 len 截断
-    pkt = build_comd_command_ex(0x80000010, payload,
-                                'f96a6d195b2946b9ab958a143ecddc26')
-    action = '重启' if reboot else '关机'
+        logger.warning('[命令] 学生 %s 未登录，拒绝关机/重启', sip)
+        return False
     try:
-        sock.sendto(pkt, (sip, PORT))
+        cmd = (0x13 if reboot else 0x14) | (0x10000000 if force else 0)
+        payload = struct.pack('<I', 0x200)
+        payload += struct.pack('<I', 0)
+        payload += struct.pack('<I', cmd)
+        payload += struct.pack('<I', delay)
+        payload += b'\x00' * 8
+        if text:
+            payload += text.encode('utf-16-le') + b'\x00\x00'
+        payload += b'\x00' * 4
+        pkt = build_comd_command_ex(0x80000010, payload,
+                                    'f96a6d195b2946b9ab958a143ecddc26')
+        action = '重启' if reboot else '关机'
+        ok = _send_main(pkt, (sip, PORT), f'{action} COMD')
         mode = '强制立即' if force else (f'倒计时{delay}秒' if delay > 0 else '立即')
-        logger.info('[命令] %s -> %s, cmd=0x%08X, delay=%d, text=%s',
-                    action, sip, cmd, delay, text)
-        print(f'[命令] 已向 {sip} 发送{mode}{action}')
-    except Exception as e:
-        logger.error('[命令] 发送%s失败：%s', action, e, exc_info=True)
-        print(f'[命令] 发送失败：{e}')
+        logger.info('[命令] %s -> %s cmd=0x%08X delay=%d mode=%s text=%s ok=%s',
+                    action, sip, cmd, delay, mode, text, ok)
+        return ok
+    except Exception as error:
+        logger.error('[命令] 发送关机/重启失败：%s', error, exc_info=True)
+        return False
 
 
 
@@ -2326,25 +3376,15 @@ def send_remote_channel_settings(sip, channel, auto_login):
     if not _check_student(sip, 'setchannel <学生IP> <1..32> [0|1]'):
         return False
     packet = build_comd_command_ex(0x80000010, payload, REMOTE_CHANNEL_GUID)
-    try:
-        sock.sendto(packet, (sip, PORT))
-    except OSError as error:
-        logger.error('[RemoteSetting] 实验性控制面发送失败 target=%s:%d '
-                     'channel=%d auto_login=%d error=%s',
-                     sip, PORT, channel, auto_login, error, exc_info=True)
-        raise
+    ok = _send_main(packet, (sip, PORT), 'RemoteChannelSettings COMD')
     logger.info(
         '[RemoteSetting] 实验性控制面 COMD category=0x4000 subcase=7 -> %s:%d '
-        'channel=%d auto_login=%d length=%d settings=%d payload=%d packet=%d；'
+        'channel=%d auto_login=%d length=%d settings=%d payload=%d packet=%d ok=%s；'
         'length 语义未知（subcase 7 不使用）；不改变教师端自身运行频道；'
         '学生端注册表写入与重启/重连效果未实机验证，官方兼容性未验证，无结果回执',
         sip, PORT, channel, auto_login, REMOTE_CHANNEL_SETTINGS_SIZE,
-        REMOTE_CHANNEL_SETTINGS_SIZE, len(payload), len(packet))
-    print(f'[远程设置] 已向 {sip}:{PORT} 发送实验性远程频道设置：'
-          f'频道={channel}，AutoLogin={auto_login}（教师端运行频道仍为 {CHANNEL_ID}）')
-    print('[远程设置] 仅发送实验性控制面；学生端注册表写入、重启/重连'
-          '及官方兼容性未实机验证')
-    return True
+        REMOTE_CHANNEL_SETTINGS_SIZE, len(payload), len(packet), ok)
+    return ok
 
 
 def build_dmoc():
@@ -2380,31 +3420,46 @@ def build_srnt(frame_seq, complete=True, missing_parts=()):
 
 
 def keep_alive_preview(sip):
-    """学生登录后周期性发送启用的 LPNT + DMOC，直到开始收到预览。"""
-    lp = build_lpnt(3, True)
-    dm = build_dmoc()
-    logger.info('[KeepAlive] 启动 %s', sip)
-    while running and sip in students:
-        if sip in previews:
-            logger.info('[KeepAlive] %s previews 已存在，停止', sip)
+    """等待策略确认或完整帧发布；不再周期性发送 LPNT/DMOC。"""
+    logger.info('[KeepAlive] 启动 %s（等待 TRNT/完整帧，不周期性回包）', sip)
+    # 记录“已为哪个期望版本做过 TTL 补发”；新的策略变更会把 expected 推进，
+    # 从而自动重新武装一次，而不是整个进程只补发一次。
+    resent_version = None
+    while (running and not network_stop_event.is_set()
+           and sip in students):
+        # 先读状态再清理过期帧，否则 TTL 分支永远拿不到 last_fragment_at。
+        with state_lock:
+            expected = preview_policy_versions.get(sip, PREVIEW_POLICY_BASE)
+            confirmed = preview_confirmed_versions.get(sip)
+            published = sip in completed_preview_frames
+            frame_state = previews.get(sip)
+            last_fragment_at = (frame_state or {}).get('last_fragment_at')
+        if published:
+            logger.info('[KeepAlive] %s 完整帧已发布，停止', sip)
             break
-        try:
-            sock.sendto(lp, (sip, PORT))
-            logger.debug('[KeepAlive] LPNT -> %s', sip)
-        except Exception as e:
-            logger.error('[KeepAlive] LPNT -> %s 失败：%s', sip, e, exc_info=True)
-        time.sleep(0.05)
-        try:
-            sock.sendto(dm, (sip, PORT))
-            logger.debug('[KeepAlive] DMOC -> %s', sip)
-        except Exception as e:
-            logger.error('[KeepAlive] DMOC -> %s 失败：%s', sip, e, exc_info=True)
-        time.sleep(0.5)
-    logger.info('[KeepAlive] %s 退出', sip)
+        if confirmed == expected:
+            logger.info('[KeepAlive] %s 策略已确认 version=%d，停止（不重复 LPNT/DMOC）',
+                        sip, expected)
+            break
+        if (resent_version != expected
+                and frame_state is not None and last_fragment_at is not None
+                and time.monotonic() - last_fragment_at > PREVIEW_FRAME_TTL):
+            resent_version = expected
+            version = _next_preview_policy_versions(sip, 1)[0]
+            _send_lpnt(sip, version, True, 'KeepAlive TTL')
+            logger.info('[KeepAlive] %s 重组 TTL 超时，为期望版本 %d 补发一次 '
+                        'LPNT version=%d', sip, resent_version, version)
+        _expire_preview_frames()
+        if _sleep_or_stop(0.55):
+            break
+    logger.info('[KeepAlive] %s 退出 published=%s confirmed=%s expected=%s',
+                sip, sip in completed_preview_frames,
+                preview_confirmed_versions.get(sip),
+                preview_policy_versions.get(sip, PREVIEW_POLICY_BASE))
 
 
 def handle_tnal(d, sip):
-    """接收 LANT 预览缩略图片段并拼成 JPEG。"""
+    """接收 LANT 预览缩略图片段并拼成 JPEG，只有发布成功才算完成。"""
     logger.debug('[LANT] RECV from %s, len=%d\n%s', sip, len(d), hexdump(d[:256]))
 
     if len(d) < 48:
@@ -2416,8 +3471,8 @@ def handle_tnal(d, sip):
         total = struct.unpack('<I', d[36:40])[0]
         offset = struct.unpack('<I', d[40:44])[0]
         frag_len = struct.unpack('<I', d[44:48])[0]
-    except struct.error as e:
-        logger.error('[TNAL] 解包失败 from %s：%s', sip, e, exc_info=True)
+    except struct.error as error:
+        logger.error('[TNAL] 解包失败 from %s：%s', sip, error, exc_info=True)
         return
 
     frag = d[48:48+frag_len]
@@ -2429,60 +3484,92 @@ def handle_tnal(d, sip):
                        frame_seq, total, offset, sip)
         return
 
-    state = previews.get(sip)
-    if state is None or state['frame_seq'] != frame_seq or state['total'] != total:
-        logger.info('[LANT] %s 新建帧 frame=%d total=%d', sip, frame_seq, total)
-        state = {
-            'frame_seq': frame_seq,
-            'total': total,
-            'buf': bytearray(total),
-            'got': 0,
-            'received': {},
-        }
-        previews[sip] = state
+    _expire_preview_frames()
+    with state_lock:
+        state = previews.get(sip)
+        if state is None or state['frame_seq'] != frame_seq or state['total'] != total:
+            logger.info('[Preview] %s 新建帧 frame=%d total=%d source=LANT',
+                        sip, frame_seq, total)
+            completed_preview_frames.pop(sip, None)
+            preview_last_errors.pop(sip, None)
+            state = {
+                'frame_seq': frame_seq,
+                'total': total,
+                'buf': bytearray(total),
+                'got': 0,
+                'received': {},
+                'last_fragment_at': time.monotonic(),
+                'publish_attempts': 0,
+                'published': False,
+            }
+            previews[sip] = state
+            _ensure_preview_keepalive(sip)
+        state['last_fragment_at'] = time.monotonic()
+        end = min(offset + len(frag), total)
+        written = end - offset
+        if written <= 0:
+            logger.warning('[LANT] 非法写入 offset=%d end=%d from %s', offset, end, sip)
+            return
+        state['buf'][offset:end] = frag[:written]
+        previous = state['received'].get(offset, 0)
+        state['received'][offset] = max(previous, written)
+        state['got'] += max(0, written - previous)
+        missing = _preview_missing_parts(state)
+        logger.info('[Preview] %s frame=%d 分片 offset=%d len=%d got=%d/%d '
+                    'missing_offsets=%d last_fragment_at=%.3f',
+                    sip, frame_seq, offset, written, state['got'], total,
+                    len(missing), state['last_fragment_at'])
+        complete = state['got'] >= total
+        image_bytes = bytes(state['buf']) if complete else None
+        attempts = state['publish_attempts']
 
-    end = min(offset + len(frag), total)
-    written = end - offset
-    if written <= 0:
-        logger.warning('[LANT] 非法写入 offset=%d end=%d from %s', offset, end, sip)
+    if not complete or attempts >= 3:
         return
 
-    state['buf'][offset:end] = frag[:written]
-    previous = state['received'].get(offset, 0)
-    state['received'][offset] = max(previous, written)
-    state['got'] += max(0, written - previous)
-    logger.debug('[LANT] %s frame=%d 进度 %d/%d (+%d)',
-                 sip, frame_seq, state['got'], total, max(0, written - previous))
-
-    if state['got'] >= total:
+    with state_lock:
+        state['publish_attempts'] = attempts + 1
+    try:
         # 极域学生端 JPEG 是 bottom-up DIB + 仅色度反相（Cb/Cr 反相，Y 不变）。
-        try:
-            img = Image.open(io.BytesIO(state['buf']))
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-            img = img.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
-            ycbcr = img.convert('YCbCr')
-            y, cb, cr = ycbcr.split()
-            img = Image.merge('YCbCr', (y, ImageOps.invert(cb), ImageOps.invert(cr))).convert('RGB')
-            if os.environ.get('TEACHER_SAVE_PREVIEWS', '0') == '1':
-                fn = os.path.join(LOG_DIR, f'preview_{sip.replace(".", "_")}_latest.jpg')
-                img.save(fn, 'JPEG', quality=95)
-                logger.info('[Preview] 已保存修复图 %s', fn)
-            try:
-                from gui_events import preview_events
-                preview_events.publish(sip, img.copy())
-            except ImportError:
-                pass
-        except Exception as e:
-            logger.error('[Preview] 图像修复失败：%s', e, exc_info=True)
+        img = Image.open(io.BytesIO(image_bytes))
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        img = img.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+        ycbcr = img.convert('YCbCr')
+        y, cb, cr = ycbcr.split()
+        img = Image.merge('YCbCr', (y, ImageOps.invert(cb),
+                                    ImageOps.invert(cr))).convert('RGB')
+        if os.environ.get('TEACHER_SAVE_PREVIEWS', '0') == '1':
+            path = os.path.join(LOG_DIR, f'preview_{sip.replace(".", "_")}_latest.jpg')
+            img.save(path, 'JPEG', quality=95)
+            logger.info('[Preview] 已保存修复图 %s', path)
+        published = img.copy()
+        gui_events.preview_events.publish(sip, published.copy())
+    except Exception as error:
+        reason = f'图像解码/发布失败：{error}'
+        with state_lock:
+            state['last_error'] = reason
+            preview_last_errors[sip] = reason
+        logger.error('[Preview] %s frame=%d %s；不标记完成，请求重传',
+                     sip, frame_seq, reason, exc_info=True)
+        _send_main(build_srnt(frame_seq, complete=False, missing_parts=None),
+                   (sip, PORT), 'Preview SRNT retry all')
+        return
 
-        logger.info('[Preview] %s 接收完成', sip)
+    with state_lock:
         completed_preview_frames[sip] = frame_seq
-        del previews[sip]
+        preview_published_at[sip] = time.time()
+        preview_image_cache[sip] = published
+        preview_last_errors.pop(sip, None)
+        previews.pop(sip, None)
+    logger.info('[Preview] %s frame=%d 接收完成并已发布 total=%d cached=%s',
+                sip, frame_seq, total, True)
+
 
 
 def handle_mess(d, sip, sp, via='unknown'):
     """解析学生端发来的 MESS 消息包（聊天/提示类）。"""
+    # 任何 MESS 来源都算在线信号，畸形包也要刷新 last_seen。
+    _mark_student_seen(sip, 'MESS', via)
     if len(d) < 12:
         logger.warning('[MESS] 包过短（%d 字节）from %s:%d via %s', len(d), sip, sp, via)
         return
@@ -2550,17 +3637,20 @@ def handle_mess(d, sip, sp, via='unknown'):
                 chunk_flag = struct.unpack('<I', payload[16:20])[0]
                 entries = _parse_id_name_pairs(payload[20:])
                 store_key = 'windows' if subtype == 6 else 'processes'
-                if sip in students:
-                    if chunk_flag == 1 or store_key not in students[sip]:
-                        students[sip][store_key] = []
-                    # 按 (id, name) 去重，防止首片丢失导致的重复累积
-                    existing = students[sip][store_key]
-                    seen = set(existing)
-                    for e in entries:
-                        if e not in seen:
-                            seen.add(e)
-                            existing.append(e)
-                total = len(students[sip][store_key]) if sip in students and store_key in students[sip] else len(entries)
+                with state_lock:
+                    entry = students.get(sip)
+                    if entry is not None:
+                        if chunk_flag == 1 or store_key not in entry:
+                            entry[store_key] = []
+                        existing = entry[store_key]
+                        seen = set(existing)
+                        for item in entries:
+                            if item not in seen:
+                                seen.add(item)
+                                existing.append(item)
+                        total = len(existing)
+                    else:
+                        total = len(entries)
                 kind = '窗口' if subtype == 6 else '进程'
                 names = '，'.join(n for _, n in entries[:6])
                 text = (f'[{kind}列表{"首片" if chunk_flag == 1 else "续片"}] '
@@ -2604,11 +3694,7 @@ def handle_mess(d, sip, sp, via='unknown'):
     if text:
         if msg_kind == 'chat':
             logger.info('[MESS] 来自 %s:%d 的聊天消息：%s', sip, sp, text)
-            try:
-                from gui_events import chat_events
-                chat_events.publish(sip, text)
-            except ImportError:
-                pass
+            gui_events.chat_events.publish(sip, text)
         elif last_status.get((sip, dedupe_key)) == text:
             # 内容无变化的同类消息（周期性窗口标题/WiFi/列表分片）只记 DEBUG
             logger.debug('[MESS] 来自 %s:%d 的状态消息(重复)：%s', sip, sp, text)
@@ -2626,29 +3712,27 @@ def handle_mess(d, sip, sp, via='unknown'):
 
 
 def broadcast():
-    logger.info('[Broadcast] 启动')
+    logger.info('[Broadcast] 启动 session_id=%s generation=%d', session_id, generation)
     first_cycle = True
-    while running:
+    cycle = 0
+    total_oonc = total_nanc = total_canc = 0
+    total_failures = 0
+    while running and not network_stop_event.is_set():
+        cycle += 1
         try:
             oonc_packet = oonc()
-            count = send_to_targets(sock, oonc_packet,
-                                    MAIN_ANNOUNCE_TARGETS, 'OONC')
-            logger.debug('[Broadcast] OONC 已发送到 %d 个目标', count)
-        except Exception as e:
-            logger.error('[Broadcast] OONC 失败：%s', e, exc_info=True)
-            oonc_packet = b''
-            count = 0
-        time.sleep(0.5)
-
-        try:
+            oonc_sent, oonc_failed = send_to_targets(
+                sock, oonc_packet, MAIN_ANNOUNCE_TARGETS, 'OONC')
             normal_packet = nanc()
             auto_packet = canc()
-            normal_count = send_to_targets(sock, normal_packet, MAIN_ANNOUNCE_TARGETS,
-                                           'NANC')
-            auto_count = send_to_targets(sock, auto_packet, MAIN_ANNOUNCE_TARGETS,
-                                         'CANC')
-            logger.debug('[Broadcast] NANC/CANC 已发送到 %d/%d 个目标',
-                         normal_count, auto_count)
+            nanc_sent, nanc_failed = send_to_targets(
+                sock, normal_packet, MAIN_ANNOUNCE_TARGETS, 'NANC')
+            canc_sent, canc_failed = send_to_targets(
+                sock, auto_packet, MAIN_ANNOUNCE_TARGETS, 'CANC')
+            total_oonc += oonc_sent
+            total_nanc += nanc_sent
+            total_canc += canc_sent
+            total_failures += oonc_failed + nanc_failed + canc_failed
             if first_cycle:
                 targets = ', '.join(f'{host}:{port}'
                                     for host, port in MAIN_ANNOUNCE_TARGETS)
@@ -2656,26 +3740,36 @@ def broadcast():
                     '[Broadcast] 首轮发送完成：OONC len=%d sent=%d；'
                     'NANC len=%d sent=%d；CANC len=%d mask=0x%08X sent=%d；'
                     'targets=%s',
-                    len(oonc_packet), count, len(normal_packet), normal_count,
-                    len(auto_packet), 1 << (CHANNEL_ID - 1), auto_count, targets)
+                    len(oonc_packet), oonc_sent, len(normal_packet), nanc_sent,
+                    len(auto_packet), 1 << (CHANNEL_ID - 1), canc_sent, targets)
                 first_cycle = False
-        except Exception as e:
-            logger.error('[Broadcast] NANC/CANC 失败：%s', e, exc_info=True)
-        time.sleep(0.5)
-    logger.info('[Broadcast] 退出')
+            if cycle % ANNOUNCE_INFO_CYCLES == 0:
+                logger.info(
+                    '[Broadcast] 发包计数 cycles=%d OONC=%d NANC=%d CANC=%d '
+                    'failures=%d generation=%d oonc_seq=%d session_id=%s',
+                    cycle, total_oonc, total_nanc, total_canc, total_failures,
+                    generation, oonc_seq, session_id)
+        except Exception as error:
+            total_failures += 1
+            logger.warning('[Broadcast] 瞬时发送错误，继续下一轮：%s', error)
+        if _sleep_or_stop(0.5):
+            break
+    logger.info('[Broadcast] 退出 cycles=%d OONC=%d NANC=%d CANC=%d failures=%d',
+                cycle, total_oonc, total_nanc, total_canc, total_failures)
 
 
 def session_anno():
-    logger.info('[Session] 广播线程启动')
+    logger.info('[Session] 广播线程启动 session_id=%s generation=%d',
+                session_id, generation)
     first_cycle = True
-    while running:
+    cycle = 0
+    total_type1 = total_type2 = total_failures = 0
+    while running and not network_stop_event.is_set():
+        cycle += 1
         try:
             pkt1 = struct.pack('<II', 0x4F4E4E41, 1)
-            type1_count = send_to_targets(sock2, pkt1, SESSION_ANNOUNCE_TARGETS,
-                                          'ANNO(type1)')
-            logger.debug('[Session] ANNO(type1) 已发送到 %d 个目标', type1_count)
-            time.sleep(0.3)
-
+            type1_sent, type1_failed = send_to_targets(
+                sock2, pkt1, SESSION_ANNOUNCE_TARGETS, 'ANNO(type1)')
             pkt2 = (struct.pack('<III', 0x4F4E4E41, 1, 1)
                     + b'\x00'*8
                     + socket.inet_aton(ip)
@@ -2684,22 +3778,32 @@ def session_anno():
                     + struct.pack('<I', 0x0D5AD030)
                     + struct.pack('<I', 1)
                     + b'\x00'*32)
-            type2_count = send_to_targets(sock2, pkt2, SESSION_ANNOUNCE_TARGETS,
-                                          'ANNO(type2)')
-            logger.debug('[Session] ANNO(type2) 已发送到 %d 个目标', type2_count)
+            type2_sent, type2_failed = send_to_targets(
+                sock2, pkt2, SESSION_ANNOUNCE_TARGETS, 'ANNO(type2)')
+            total_type1 += type1_sent
+            total_type2 += type2_sent
+            total_failures += type1_failed + type2_failed
             if first_cycle:
                 targets = ', '.join(f'{host}:{port}'
                                     for host, port in SESSION_ANNOUNCE_TARGETS)
                 logger.info(
                     '[Session] 首轮发送完成：ANNO(type1) len=%d sent=%d；'
                     'ANNO(type2) len=%d sent=%d；targets=%s',
-                    len(pkt1), type1_count, len(pkt2), type2_count, targets)
+                    len(pkt1), type1_sent, len(pkt2), type2_sent, targets)
                 first_cycle = False
-            time.sleep(0.7)
-        except Exception as e:
-            logger.error('[Session] 广播异常：%s', e, exc_info=True)
+            if cycle % ANNOUNCE_INFO_CYCLES == 0:
+                logger.info(
+                    '[Session] 发包计数 cycles=%d ANNO1=%d ANNO2=%d '
+                    'failures=%d generation=%d oonc_seq=%d session_id=%s',
+                    cycle, total_type1, total_type2, total_failures,
+                    generation, oonc_seq, session_id)
+        except Exception as error:
+            total_failures += 1
+            logger.warning('[Session] 瞬时广播错误，继续下一轮：%s', error)
+        if _sleep_or_stop(0.5):
             break
-    logger.info('[Session] 广播线程退出')
+    logger.info('[Session] 广播线程退出 cycles=%d ANNO1=%d ANNO2=%d failures=%d',
+                cycle, total_type1, total_type2, total_failures)
 
 
 def build_session_reply(recipient_ip, msg_type):
@@ -2725,9 +3829,10 @@ def build_session_reply(recipient_ip, msg_type):
             + payload)
 
 
-def handle_student_anno(d, sip):
+def handle_student_anno(d, sip, via='unknown'):
     """解析学生端单播的 64 字节课堂状态块（0x41A590 / 0x43D870）。"""
-    if len(d) != 72 or sip not in students:
+    _mark_student_seen(sip, 'ANNO', via)
+    if len(d) != 72:
         return False
     fields = struct.unpack_from('<16I', d, 8)
     state = {
@@ -2737,19 +3842,24 @@ def handle_student_anno(d, sip):
         'student_demo': bool(fields[0] & 0x04),
         'raw': fields,
     }
-    previous = students[sip].get('anno_state')
-    students[sip]['anno_state'] = state
+    with state_lock:
+        entry = students.get(sip)
+        if entry is None:
+            return False
+        previous = entry.get('anno_state')
+        entry['anno_state'] = state
     if previous != state:
-        logger.info('[StudentState] %s hand_up=%s flags=%#010x lock=%#010x raw=%s',
-                    sip, state['hand_up'], state['student_flags'],
+        logger.info('[StudentState] %s via=%s hand_up=%s flags=%#010x lock=%#010x raw=%s',
+                    sip, via, state['hand_up'], state['student_flags'],
                     state['blackscreen_flags'], ' '.join(f'{v:08x}' for v in fields))
     return True
 
 
 def session_recv():
     logger.info('[SessionRecv] 启动')
-    sock2.settimeout(1)
-    while running:
+    while running and not network_stop_event.is_set():
+        if sock2 is None:
+            break
         try:
             d, a = sock2.recvfrom(4096)
             sip, sp = a
@@ -2765,69 +3875,72 @@ def session_recv():
             mag = struct.unpack('<I', d[:4])[0]
 
             if mag == 0x49474F4C:  # LOGI
-                already_logged_in = sip in students
-                # 已登录学生会周期性重发 LOGI（相当于心跳），属常态——
-                # 回复包照发，但日志降为 DEBUG，避免每次心跳刷 4 条 INFO。
+                with state_lock:
+                    entry = students.get(sip)
+                    already_logged_in = bool(entry and entry.get('logged_in'))
+                _mark_student_seen(sip, 'LOGI', 'SessionRecv', logged_in=True)
+                with state_lock:
+                    preserved_mac = students.get(sip, {}).get('info', {}).get('mac', '')
                 log = logger.debug if already_logged_in else logger.info
+                log('[Login] %s 保留已有 info/mac=%s', sip, preserved_mac or '-')
                 log('[SessionRecv] LOGI from %s:%d%s', sip, sp,
                     '（周期重复）' if already_logged_in else '')
 
-                # 1) 真实教师端第一条回复：msg_type=0x1000，总长 0x0d
                 mess1 = build_session_reply(sip, 0x1000)
-                sock2.sendto(mess1, (sip, SPORT))
+                if not _send_session(mess1, (sip, SPORT), 'SessionReply 0x1000'):
+                    logger.warning('[SessionRecv] 0x1000 回复未送达 %s', sip)
                 log('[MESS] type 0x1000 -> %s:%d, len=%d', sip, SPORT, len(mess1))
-                time.sleep(0.05)
+                if _sleep_or_stop(0.05):
+                    break
 
-                # 2) 真实教师端第二条回复：msg_type=0x8000，总长 0x1b
                 mess2 = build_session_reply(sip, 0x8000)
-                sock2.sendto(mess2, (sip, SPORT))
+                if not _send_session(mess2, (sip, SPORT), 'SessionReply 0x8000'):
+                    logger.warning('[SessionRecv] 0x8000 回复未送达 %s', sip)
                 log('[MESS] type 0x8000 -> %s:%d, len=%d', sip, SPORT, len(mess2))
-                time.sleep(0.05)
+                if _sleep_or_stop(0.05):
+                    break
 
                 if already_logged_in:
                     continue
 
-                lg = bytes.fromhex('aa3a8dbe2b906645908ea29526218540')
-                lp = struct.pack('<II', 0x544E504C, 0x10000) + struct.pack('<I', 20) + lg + b'\x02\x00\x00\x00\x00\x00\x00\x00\x50\x00\x00\x00\x3c\x00\x00\x00\x05\x00\x00\x00'
-                sock.sendto(lp, (sip, PORT))
-                logger.info('[LPNT] subtype=2 -> %s:%d', sip, PORT)
-
-                lp2 = bytes(lp)
-                lp2 = lp2[:28] + b'\x03\x00\x00\x00\x01\x00\x00\x00' + lp2[36:]
-                sock.sendto(lp2, (sip, PORT))
-                logger.info('[LPNT] subtype=3 -> %s:%d', sip, PORT)
-
-                dm = build_dmoc()
-                sock.sendto(dm, (sip, PORT))
-                logger.info('[DMOC] -> %s:%d, len=%d', sip, PORT, len(dm))
-
-                students[sip] = {'logged_in': True}
+                _send_preview_policy(sip, True, 'LOGI', count=2)
                 logger.info('[Login] %s 登录成功，students=%s', sip, list(students.keys()))
-
-                # 登录后自动请求学生信息（计算机名/MAC/用户/OS/CPU/内存）
-                time.sleep(0.2)
                 request_info(sip)
+                _ensure_preview_keepalive(sip)
 
-                threading.Thread(target=keep_alive_preview, args=(sip,), daemon=True).start()
-
-            elif mag == 0x5353454D:  # MESS 学生端发来的消息
+            elif mag == 0x5353454D:  # MESS
                 handle_mess(d, sip, sp, 'SessionRecv')
 
-            elif mag == 0x4F4E4E41:  # ANNO 学生端课堂状态
-                handle_student_anno(d, sip)
+            elif mag == 0x4F4E4E41:  # ANNO
+                handle_student_anno(d, sip, 'SessionRecv')
+
+            elif mag == 0x4F474F4C:  # LOGO
+                logger.info('[SessionRecv] %s from %s:%d', magic_name(mag), sip, sp)
+                _handle_student_logout(sip, 'SessionRecv')
+
+            elif mag == 0x434D5254:  # TRMC
+                _handle_trmc(d, sip, 'SessionRecv')
+
+            elif mag == 0x544E5254:  # TRNT
+                _handle_trnt(d, sip, 'SessionRecv')
+
+            elif mag in CLIENT_PACKET_MAGICS:
+                _handle_client_packet(mag, d, sip, 'SessionRecv')
 
             elif mag not in ROUTINE_MAGICS:
-                # 非日常广播包才记录，减少噪音
                 logger.warning(
                     '[SessionRecv] 未认证/非登录包 %s from %s:%d, len=%d\n%s',
-                    magic_name(mag), sip, sp, len(d), hexdump(d[:256])
-                )
+                    magic_name(mag), sip, sp, len(d), hexdump(d[:256]))
 
         except socket.timeout:
+            if network_stop_event.is_set():
+                break
             continue
-        except Exception as e:
-            if running:
-                logger.error('[SessionRecv] 异常：%s', e, exc_info=True)
+        except Exception as error:
+            if running and not network_stop_event.is_set():
+                logger.error('[SessionRecv] 异常：%s', error, exc_info=True)
+            else:
+                break
     logger.info('[SessionRecv] 退出')
 
 
@@ -3200,12 +4313,10 @@ def respond_submit_request(sip, accept):
             logger.exception('[FileSubmit] 接收服务未就绪 sip=%s guid=%s port=%d；保留 pending',
                              sip, request['transaction_guid'], SUBMISSION_PORT)
             raise RuntimeError(f'文件接收服务启动失败，RRMS 未发送：{error}') from error
-    try:
-        sock.sendto(packet, (sip, PORT))
-    except Exception:
-        logger.exception('[FileSubmit] RRMS 发送失败 sip=%s guid=%s accept=%s；保留 pending',
-                         sip, request['transaction_guid'], bool(accept))
-        raise
+    if not _send_main(packet, (sip, PORT), 'RRMS'):
+        logger.error('[FileSubmit] RRMS 发送失败 sip=%s guid=%s accept=%s；保留 pending',
+                     sip, request['transaction_guid'], bool(accept))
+        raise OSError('RRMS 发送失败')
     request['status'] = 'approved' if accept else 'rejected'
     request['submission_port'] = listen_port if accept else 0
     request['submission_directory'] = transaction_directory if accept else None
@@ -3228,9 +4339,10 @@ def respond_submit_request(sip, accept):
 
 
 def main_recv():
-    global running
     logger.info('[MainRecv] 启动')
-    while running:
+    while running and not network_stop_event.is_set():
+        if sock is None:
+            break
         try:
             d, a = sock.recvfrom(4096)
             sip, sp = a
@@ -3245,17 +4357,17 @@ def main_recv():
 
             mag = struct.unpack('<I', d[:4])[0]
 
-            # 日常广播（OONC/NANC/CANC）直接跳过，不记录
+            # ANNO 虽属日常广播，但任意来源都要更新 last_seen。
+            if mag == 0x4F4E4E41:
+                handle_student_anno(d, sip, 'MainRecv')
+                continue
             if mag in ROUTINE_MAGICS:
                 continue
 
             if sip not in students:
-                logger.warning(
-                    '[MainRecv] 未登录学生 %s:%d 发送 %s',
-                    sip, sp, magic_name(mag)
-                )
+                logger.warning('[MainRecv] 未登录学生 %s:%d 发送 %s',
+                               sip, sp, magic_name(mag))
 
-            # TRMC/TRNT 是心跳/预览就绪包，数量很大，默认用 DEBUG
             if mag in (0x434D5254, 0x544E5254):
                 logger.debug('[MainRecv] %s from %s:%d, len=%d',
                              magic_name(mag), sip, sp, len(d))
@@ -3265,58 +4377,74 @@ def main_recv():
 
             if mag == 0x4143414B:  # KACA
                 logger.info('[MainRecv] KACA %s -> WACA', sip)
-                sock.sendto(waca(sip), (sip, PORT))
+                _send_main(waca(sip), (sip, PORT), 'WACA')
 
             elif mag == 0x434D5254:  # TRMC
-                logger.debug('[MainRecv] TRMC %s -> LPNT+DMOC', sip)
-                lp = build_lpnt(3, True)
-                dm = build_dmoc()
-                sock.sendto(lp, (sip, PORT))
-                time.sleep(0.05)
-                sock.sendto(dm, (sip, PORT))
+                _handle_trmc(d, sip, 'MainRecv')
 
             elif mag == 0x544E5254:  # TRNT
-                logger.debug('[MainRecv] TRNT %s 学生准备好预览', sip)
+                _handle_trnt(d, sip, 'MainRecv')
 
             elif mag == 0x544E4544:  # DENT
                 if len(d) < 40:
                     logger.warning('[MainRecv] DENT 包过短：%d from %s', len(d), sip)
                     continue
                 frame_seq = struct.unpack('<I', d[36:40])[0]
-                state = previews.get(sip)
+                _expire_preview_frames()
+                with state_lock:
+                    state = previews.get(sip)
+                    published_frame = completed_preview_frames.get(sip)
                 if state and state['frame_seq'] == frame_seq:
-                    part_count = (state['total'] + 1023) // 1024
-                    missing = [index for index in range(part_count)
-                               if index * 1024 not in state['received']]
+                    missing = _preview_missing_parts(state)
+                    missing_offsets = [item[0] for item in _preview_missing_ranges(state)]
                     pkt = build_srnt(frame_seq, complete=not missing,
                                      missing_parts=missing)
-                    action = 'complete' if not missing else f'retry {len(missing)} parts'
-                elif completed_preview_frames.get(sip) == frame_seq:
+                    action = 'complete' if not missing else f'retry parts={missing}'
+                    logger.info('[Preview] %s DENT frame=%d got=%d/%d '
+                                'missing_offsets=%s missing_parts=%s -> SRNT %s',
+                                sip, frame_seq, state['got'], state['total'],
+                                missing_offsets, missing, action)
+                elif published_frame == frame_seq:
                     pkt = build_srnt(frame_seq, complete=True)
                     action = 'complete'
+                    logger.info('[Preview] %s DENT frame=%d -> SRNT complete（已发布）',
+                                sip, frame_seq)
                 else:
                     pkt = build_srnt(frame_seq, complete=False, missing_parts=None)
                     action = 'retry all'
-                logger.info('[MainRecv] DENT %s frame=%d -> SRNT %s',
-                            sip, frame_seq, action)
-                sock.sendto(pkt, (sip, PORT))
+                    logger.info('[Preview] %s DENT frame=%d -> SRNT retry all（无缓存帧）',
+                                sip, frame_seq)
+                _send_main(pkt, (sip, PORT), 'Preview SRNT')
 
             elif mag == 0x544E414C:  # LANT
                 handle_tnal(d, sip)
 
-            elif mag == 0x5353454D:  # MESS 学生端发来的消息
+            elif mag == 0x5353454D:  # MESS
                 handle_mess(d, sip, sp, 'MainRecv')
 
-            elif mag == 0x534D5251:  # QRMS 学生文件提交请求
+            elif mag == 0x4F474F4C:  # LOGO
+                logger.info('[MainRecv] %s from %s:%d', magic_name(mag), sip, sp)
+                _handle_student_logout(sip, 'MainRecv')
+
+            elif mag == 0x534D5251:  # QRMS
                 handle_submit_request(d, sip)
+
+            elif mag in CLIENT_PACKET_MAGICS:
+                _handle_client_packet(mag, d, sip, 'MainRecv')
 
             else:
                 logger.warning('[MainRecv] 未知包 %s from %s:%d, len=%d\n%s',
                                hex(mag), sip, sp, len(d), hexdump(d[:256]))
 
-        except Exception as e:
-            if running:
-                logger.error('[MainRecv] 异常：%s', e, exc_info=True)
+        except socket.timeout:
+            if network_stop_event.is_set():
+                break
+            continue
+        except Exception as error:
+            if running and not network_stop_event.is_set():
+                logger.error('[MainRecv] 异常：%s', error, exc_info=True)
+            else:
+                break
     logger.info('[MainRecv] 退出')
 
 
@@ -3445,9 +4573,9 @@ def _check_student(sip, usage):
     if sip in students:
         return True
     if '.' not in sip:
-        print(f'[命令] "{sip}" 不是有效的学生 IP——是不是漏填了 IP?用法:{usage}')
+        logger.warning('[命令] "%s" 不是有效的学生 IP；用法:%s', sip, usage)
     else:
-        print(f'[命令] 学生 {sip} 未登录')
+        logger.warning('[命令] 学生 %s 未登录或不在快照中', sip)
     return False
 
 
@@ -3589,27 +4717,39 @@ def cmd_wins(args):
 def cmd_preview(args):
     if not args:
         print('[命令] 用法：preview <学生IP>')
-        return
+        return False
     sip = args[0]
-    request_preview(sip)
-    print(f'[命令] 已向 {sip} 请求预览')
+    ok = request_preview(sip)
+    print(f'[命令] 已向 {sip} 请求预览 ok={ok}')
+    return ok
 
 
 def cmd_view(args):
     if not args:
         print('[命令] 用法：view <学生IP> [TCP端口]')
-        return
+        return {'ok': False, 'active': False, 'action': 'start',
+                'reason': '缺少学生 IP', 'cooldown_remaining': 0.0}
     sip = args[0]
     try:
         port = int(args[1].strip(), 0) if len(args) > 1 else TCP_COMM_PORT
         if not 1 <= port <= 0xFFFF:
             raise ValueError('端口必须在 1..65535')
-        if start_remote_view(sip, port):
+    except ValueError as error:
+        result = {'ok': False, 'active': False, 'action': 'start',
+                  'reason': f'参数错误：{error}', 'cooldown_remaining': 0.0}
+        logger.warning('[观看] %s 参数错误：%s', sip, error)
+        print(f'[观看] 参数错误：{error}')
+        return result
+    result = toggle_remote_view(sip, port)
+    if result['ok']:
+        if result['action'] == 'stopped':
+            print(f'[观看] 已停止 {sip}')
+        else:
             print(f'[观看] 已启动 {sip}:{port}，正在连接；画面由 ffplay 显示')
-    except ValueError as e:
-        print(f'[观看] 参数错误：{e}')
-    except OSError as e:
-        print(f'[观看] 启动失败：{e}')
+    else:
+        logger.warning('[观看] %s 操作未成功：%s', sip, result['reason'])
+        print(f'[观看] 操作未成功：{result["reason"]}')
+    return result
 
 
 def cmd_view_probe(args):
@@ -3709,13 +4849,11 @@ def cmd_key(args):
 
 
 def cmd_all():
-    if not students:
-        print('[命令] 当前无学生登录')
-        return
-    for sip in list(students.keys()):
-        request_preview(sip)
-        time.sleep(0.05)
-    print(f'[命令] 已向 {len(students)} 个学生请求预览')
+    if not request_all_previews():
+        print('[命令] 当前无学生登录或网络未启动')
+        return False
+    print('[命令] 已后台提交全班预览请求')
+    return True
 
 
 def cmd_debug(args):
@@ -3884,18 +5022,56 @@ def command_loop():
 # -------------------- 启动 --------------------
 
 def start_background_threads():
+    """启动网络与 4 个后台线程；重复调用保持幂等，失败返回 False。
+
+    start_network() 可重复调用（GUI 先调、这里再调也安全），导入模块不会 bind。
+    """
+    global running
+    if not start_network():
+        logger.error('[Threads] 网络未就绪，后台线程不启动 error=%s', network_error)
+        return False
+    with shutdown_lock:
+        running = True
+    _reset_classroom_writer_for_restart()
     logger.info('启动 4 个后台线程')
-    _start_classroom_writer()
+    started, failed = [], []
     for name, target in (
         ('broadcast', broadcast), ('session_anno', session_anno),
         ('session_recv', session_recv), ('main_recv', main_recv),
     ):
-        threading.Thread(target=target, name=name, daemon=True).start()
+        thread = _start_managed_thread(name, target)
+        if thread is None:
+            failed.append(name)
+        else:
+            started.append(name)
+    logger.info('[Threads] 后台线程启动完成 started=%s failed=%s running=%s '
+                'session_id=%s generation=%d',
+                started, failed, running, session_id, generation)
+    return not failed
 
 
 def shutdown():
+    """停止网络与后台线程；重复调用直接返回 False。
+
+    顺序：置停止标志 → 通知学生停止 feature/MCMD（allow_when_stopped）→
+    有界 join 后台线程 → 关闭 socket → 释放单实例 Mutex。socket 只在线程
+    停止后关闭，避免现场日志里的 WinError 10038 退出竞态。
+    """
     global running, classroom_shutdown, submission_server, submission_listen_port
-    running = False
+    global shutdown_stage
+    with shutdown_lock:
+        if shutdown_stage is not None:
+            logger.debug('[Shutdown] 已执行或正在执行，忽略重复调用 stage=%s',
+                         shutdown_stage)
+            return False
+        shutdown_stage = 'stopping'
+        running = False
+        network_stop_event.set()
+    had_network = network_started and not network_sockets_closed
+    logger.info('[Shutdown] 开始 session_id=%s network=%s students=%d previews=%d '
+                'views=%d controls=%d',
+                session_id, had_network, len(students), len(previews),
+                len(remote_views), len(remote_controls))
     with submission_lock:
         server, submission_server = submission_server, None
         closed_port, submission_listen_port = submission_listen_port, None
@@ -3910,36 +5086,61 @@ def shutdown():
     with classroom_lock:
         if not classroom_shutdown:
             classroom_shutdown = True
-            _start_classroom_writer()
-            classroom_write_queue.put(None)
-    classroom_write_queue.join()
-    for timer in list(blackscreen_timers.values()):
-        timer.cancel()
-    blackscreen_timers.clear()
-    for sip in list(remote_views):
-        stop_remote_view(sip, notify=False)
-    for sip in list(remote_controls):
-        stop_remote_control(sip, notify=False)
-    for sip in list(screen_broadcasts):
-        try:
-            stop_screen_broadcast(sip)
-        except OSError as error:
-            logger.warning('[Broadcast] 退出时停止 %s 失败：%s', sip, error)
-    for source_ip in list(student_demos):
-        try:
-            stop_student_demo(source_ip)
-        except OSError as error:
-            logger.warning('[Demo] 退出时停止 %s 失败：%s', source_ip, error)
-    for network_socket in (sock, sock2):
-        try:
-            network_socket.close()
-        except OSError:
-            pass
-    logger.info('程序退出。students=%s, previews=%s', list(students.keys()), list(previews.keys()))
+            try:
+                _start_classroom_writer()
+                classroom_write_queue.put(None)
+            except Exception as error:
+                logger.warning('[Classroom] 退出时启动写盘收尾失败：%s', error)
+    _bounded_queue_join()
+    try:
+        for timer in list(blackscreen_timers.values()):
+            timer.cancel()
+        blackscreen_timers.clear()
+        # 退出时仍要发已证实的 feature/MCMD 停止包（notify=True），
+        # 让丢掉 TCP/UDP 会话前学生端停止采集与远控接收。
+        for sip in list(remote_views):
+            try:
+                stop_remote_view(sip, notify=True)
+            except Exception as error:
+                logger.warning('[Shutdown] 停止观看失败 %s：%s', sip, error)
+        for sip in list(remote_controls):
+            try:
+                stop_remote_control(sip, notify=True)
+            except Exception as error:
+                logger.warning('[Shutdown] 停止远控失败 %s：%s', sip, error)
+        for sip in list(screen_broadcasts):
+            try:
+                stop_screen_broadcast(sip)
+            except Exception as error:
+                logger.warning('[Broadcast] 退出时停止 %s 失败：%s', sip, error)
+        for source_ip in list(student_demos):
+            try:
+                stop_student_demo(source_ip)
+            except Exception as error:
+                logger.warning('[Demo] 退出时停止 %s 失败：%s', source_ip, error)
+    except Exception as error:
+        logger.error('[Shutdown] 停止本地会话时异常：%s', error, exc_info=True)
+    finally:
+        joined = _join_background_threads()
+        _close_network_sockets()
+        _release_single_instance_mutex()
+        logger.info('[Shutdown] 未发送 FNXT/TQNC/TRXT：目的封装、尾部 6 字节、'
+                    'GUID 与 +0x1C 语义未证实，只解析记录、不构造')
+        logger.info('程序退出。students=%s, previews=%s, threads_joined=%s',
+                    list(students.keys()), list(previews.keys()), joined)
+        with shutdown_lock:
+            shutdown_stage = 'done'
+    return True
 
 
 if __name__ == '__main__':
     spawn_log_window()
-    start_background_threads()
-    command_loop()
-    shutdown()
+    if not start_background_threads():
+        logger.error('教师端启动失败：网络未就绪 error=%s', network_error)
+        print(f'[启动] 网络启动失败：{network_error}')
+        shutdown()
+        raise SystemExit(1)
+    try:
+        command_loop()
+    finally:
+        shutdown()

@@ -5,6 +5,8 @@ submissions/
 *.log
 classroom_config.json
 classrooms.json
+teacher_network_state.json
+teacher_network_state.json.*.tmp
 .venv/
 venv/
 .build/

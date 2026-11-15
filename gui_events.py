@@ -1,4 +1,11 @@
 import logging
+import threading
+
+
+logger = logging.getLogger(__name__)
+
+# 防止 log_events 回调异常 -> logger.exception -> LogBridge -> log_events 递归。
+_publish_guard = threading.local()
 
 
 class EventChannel:
@@ -13,8 +20,19 @@ class EventChannel:
             self.callbacks.remove(callback)
 
     def publish(self, *args):
+        # 单个 GUI 回调异常不能中断网络线程（例如把预览发布误判为解码失败）。
         for callback in tuple(self.callbacks):
-            callback(*args)
+            try:
+                callback(*args)
+            except Exception:
+                if getattr(_publish_guard, 'active', False):
+                    continue
+                _publish_guard.active = True
+                try:
+                    logger.exception('[Events] 回调失败 callback=%s',
+                                     getattr(callback, '__qualname__', callback))
+                finally:
+                    _publish_guard.active = False
 
 
 preview_events = EventChannel()
