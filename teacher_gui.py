@@ -53,10 +53,32 @@ TOOLBAR_ITEMS = (
     ('分组教学', 'group', 'unavailable'),
     ('考试', 'exam', 'unavailable'),
     ('调查', 'survey', 'unavailable'),
-    ('抢答竞赛', 'contest', 'unavailable'),
+    ('抢答竞赛', 'contest', 'experimental'),
     ('文件分发', 'distribute', 'unavailable'),
     ('文件收集', 'collect', 'ready'),
 )
+
+DEVICE_POLICY_CHOICES = (
+    (0, '开放（Free）'),
+    (1, '只读（Readonly）'),
+    (2, '禁止执行（NoExecute）'),
+    (3, '完全禁止（Block）'),
+)
+PRINTER_POLICY_CHOICES = (
+    (0, '不限制（UNRESTRICTED）'),
+    (2, '全部禁止（Block All）'),
+)
+APP_WEB_POLICY_CHOICES = (
+    (0, '默认值 0（语义未验证）'),
+    (1, '值 1（语义未验证）'),
+    (2, '值 2（语义未验证）'),
+    (3, '值 3（语义未验证）'),
+)
+MODULE_FEATURE_LABELS = {
+    'response': '抢答竞赛',
+    'quiz': '随堂小考',
+    'instant': '快速测评',
+}
 
 STARTUP_WARNINGS = []
 RUNNING_WORKERS = []
@@ -1335,8 +1357,15 @@ class MainWindow(QMainWindow):
                      ('结束进程', self.kill_selected_process),
                      ('关闭窗口', self.close_selected_window),
                      ('关机 / 重启', lambda: self.selected('power')),
+                     ('行为限制…', self.behavior_restriction_dialog),
                      ('远程频道实验控制', self.remote_channel_dialog),
                      ('频道与接收设置…', self.channel_settings),),
+            '抢答竞赛': (('启动抢答竞赛', lambda: self.module_feature('response', True)),
+                     ('停止抢答竞赛', lambda: self.module_feature('response', False)),
+                     ('启动随堂小考', lambda: self.module_feature('quiz', True)),
+                     ('停止随堂小考', lambda: self.module_feature('quiz', False)),
+                     ('启动快速测评', lambda: self.module_feature('instant', True)),
+                     ('停止快速测评', lambda: self.module_feature('instant', False)),),
             '文件收集': (('切换到文件收集视图', self.show_collect_view),
                      ('接受选中提交', lambda: self.review_submit_request(True)),
                      ('全部接受', lambda: self.review_all_submit_requests(True)),
@@ -1589,6 +1618,7 @@ class MainWindow(QMainWindow):
             ('远程运行', lambda: self.selected('run_program')),
             ('打开网页', lambda: self.selected('open_url')),
             ('远程频道', self.remote_channel_dialog),
+            ('行为限制', self.behavior_restriction_dialog),
             ('结束进程', self.kill_selected_process),
             ('关闭窗口', self.close_selected_window),
             ('关机 / 重启', lambda: self.selected('power')),
@@ -1968,9 +1998,11 @@ class MainWindow(QMainWindow):
                               f'仅界面数值 {value}（未实现学生端音量控制）', ok=False)
 
     def clear_log_display(self):
-        self.log_text.clear()
+        # 先上报操作再清空：report_operation 会把 [UI] 行同步写进日志视图
+        # （LogBridge 是同步 publish），顺序反了会让画面重新出现一行。
         self.report_operation('清空日志显示', core.LOG_PATH,
                               '已清空界面日志；文件日志不受影响', ok=True)
+        self.log_text.clear()
 
     def set_debug_logging(self, enabled):
         level = logging.DEBUG if enabled else logging.INFO
@@ -2002,6 +2034,14 @@ class MainWindow(QMainWindow):
 
     def report_operation(self, operation, target, result, ok=True):
         stamp = time.strftime('%H:%M:%S')
+        # 每条 UI 操作都必须落盘到程序目录的 teacher_sim.log（带 [UI] 前缀）。
+        # '执行中…' 只是占位，不重复记一次。
+        if result != '执行中…':
+            log = getattr(core, 'logger', None)
+            if log is not None:
+                level = log.info if ok else log.warning
+                level('[UI] %s | 实际目标=%s | 结果=%s', operation,
+                      target or '—', result)
         self.last_action_label.setText(
             f'最近操作：{operation} | 实际目标：{target or "—"} | 结果：{result} | {stamp}')
         self.last_action_label.setProperty('error', not ok)
@@ -3052,6 +3092,140 @@ class MainWindow(QMainWindow):
                 f'已向 {ip} 单播远程频道设置（频道 {channel}，AutoLogin {auto_login}）。\n\n'
                 '注册表写入、频道切换与重启/重连效果均未实机验证；'
                 '教师端自身运行频道未改变。')
+
+    # ---------- 行为限制 / 模块启停 ----------
+
+    def online_targets(self):
+        """已登录（收到过 LOGI）的学生 IP 列表。
+
+        纯 ANNO/MESS 信号条目没有 LOGI，向它发命令只会被学生端丢掉，
+        所以这里按 logged_in 过滤；若快照整体缺少该字段则退回全部条目。
+        """
+        snapshot = self.students_snapshot()
+        online = [ip for ip, entry in snapshot.items()
+                  if (entry or {}).get('logged_in')]
+        if not online and snapshot:
+            online = list(snapshot)
+        return online
+
+    @staticmethod
+    def _policy_combo(choices):
+        box = QComboBox()
+        for value, label in choices:
+            box.addItem(label, value)
+        return box
+
+    def behavior_restriction_dialog(self, ip=None):
+        ip = ip or self.current_ip
+        online = self.online_targets()
+        if not online:
+            self.report_operation('行为限制', '—', '当前没有在线学生', ok=False)
+            QMessageBox.information(self, '没有在线学生',
+                                    '请先让学生上线，再下发行为限制。')
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle('行为限制（远程设置）')
+        dialog.setMinimumWidth(480)
+        layout = QVBoxLayout(dialog)
+        hint = QLabel('COMD category=0x200 / command_id=0x17。U 盘、光驱、打印的取值'
+                      '已由学生端反汇编证实；App/Web 两个值学生端只保存不解释，'
+                      '1/2/3 的语义未验证。')
+        hint.setWordWrap(True)
+        hint.setObjectName('muted')
+        layout.addWidget(hint)
+        form = QFormLayout()
+        scope = QComboBox()
+        scope.addItem(f'当前选中学生（{ip or "未选择"}）', 'one')
+        scope.addItem(f'全部在线学生（{len(online)} 台）', 'all')
+        if not ip:
+            scope.setCurrentIndex(1)
+        form.addRow('下发范围', scope)
+        app_box = self._policy_combo(APP_WEB_POLICY_CHOICES)
+        web_box = self._policy_combo(APP_WEB_POLICY_CHOICES)
+        usb_box = self._policy_combo(DEVICE_POLICY_CHOICES)
+        cd_box = self._policy_combo(DEVICE_POLICY_CHOICES)
+        printer_box = self._policy_combo(PRINTER_POLICY_CHOICES)
+        form.addRow('程序策略（App）', app_box)
+        form.addRow('上网策略（Web）', web_box)
+        form.addRow('U 盘策略', usb_box)
+        form.addRow('光驱策略', cd_box)
+        form.addRow('打印策略', printer_box)
+        layout.addLayout(form)
+        warning = QLabel('这是真实的策略下发：学生机会按取值挂载/只读化 U 盘与光驱、'
+                         '禁用打印，且没有结果回执。恢复默认请把五项都选 0 再下发。')
+        warning.setObjectName('warning')
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        buttons.addButton('下发', QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self.report_operation('行为限制', ip or '全班', '已取消', ok=True)
+            return
+        if scope.currentData() == 'one':
+            if not ip:
+                self.report_operation('行为限制', '—', '未选择终端', ok=False)
+                return
+            targets = [ip]
+            target_text = ip
+        else:
+            targets = online
+            target_text = f'{len(targets)} 台'
+        values = {'app': app_box.currentData(), 'web': web_box.currentData(),
+                  'usb': usb_box.currentData(), 'cd': cd_box.currentData(),
+                  'printer': printer_box.currentData()}
+        summary = '，'.join((
+            f'App={app_box.currentText()}', f'Web={web_box.currentText()}',
+            f'U盘={usb_box.currentText()}', f'光驱={cd_box.currentText()}',
+            f'打印={printer_box.currentText()}'))
+        if not self.confirm(
+                '二次确认 · 行为限制',
+                f'目标：{", ".join(targets)}\n策略：{summary}\n\n'
+                'U 盘/光驱/打印会真实生效且没有结果回执；App/Web 语义未验证。'):
+            self.report_operation('行为限制', target_text, '已取消', ok=True)
+            return
+        result = self.run_action(
+            '行为限制',
+            lambda: core.send_behavior_restrictions(targets, **values),
+            target=target_text)
+        if result:
+            sent = result.get('sent', 0) if isinstance(result, dict) else 0
+            failed = result.get('failed', []) if isinstance(result, dict) else []
+            QMessageBox.information(
+                self, '已下发行为限制',
+                f'{summary}\n\n已单播 {sent} 台，失败 {len(failed)} 台。\n'
+                'COMD 0x80000010 / category=0x200 / command_id=0x17，'
+                '32 字节 payload + 4 字节尾部 NUL。\n'
+                '学生端没有结果回执；U 盘/光驱/打印会真实生效，'
+                '恢复默认需把五项都选 0 再下发一次。')
+
+    def module_feature(self, module, enabled):
+        label = MODULE_FEATURE_LABELS.get(module, module)
+        online = self.online_targets()
+        action = '启动' if enabled else '停止'
+        if not online:
+            self.report_operation(label, '—', '当前没有在线学生', ok=False)
+            QMessageBox.information(self, '没有在线学生',
+                                    f'{action}{label}前请先让学生上线。')
+            return
+        if not self.confirm(
+                f'{action}{label}',
+                f'模块：{label}\n目标：全部在线学生（{len(online)} 台）\n\n'
+                '只发送已证实的 MESS feature 启停位（+0x14 feature、'
+                '+0x18 停止位 0x10000000），学生端据此创建/销毁对应客户端。\n'
+                '题目、评分、奖励等数据面尚未闭合，不会发送；'
+                '真实学生端效果未验证。'):
+            self.report_operation(label, f'{len(online)} 台', '已取消', ok=True)
+            return
+        result = self.run_action(label, 'send_module_feature', module, enabled,
+                                 online, target=f'{len(online)} 台')
+        if isinstance(result, dict) and not result.get('ok'):
+            QMessageBox.warning(
+                self, f'{action}{label}未完全成功',
+                f"成功 {result.get('sent', 0)} 台，失败 {len(result.get('failed', []))} 台。\n"
+                '详见日志与消息中心。')
 
     # ---------- QRMS / RRMS 审批 ----------
 

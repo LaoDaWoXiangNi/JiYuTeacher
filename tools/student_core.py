@@ -22,6 +22,23 @@ except ImportError:
 
 LOGGER = logging.getLogger('student_sim')
 
+RESTRICTIONS_COMMAND_ID = 0x17
+RESTRICTIONS_PAYLOAD_SIZE = 0x20
+DEVICE_RESTRICTION_LABELS = {0: '开放', 1: '只读', 2: '禁止执行', 3: '完全禁止'}
+PRINTER_RESTRICTION_LABELS = {0: '不限制', 2: '全部禁止'}
+
+
+def _device_restriction_text(value: int) -> str:
+    return DEVICE_RESTRICTION_LABELS.get(value, f'未知值（{value}）')
+
+
+def _printer_restriction_text(value: int) -> str:
+    return PRINTER_RESTRICTION_LABELS.get(value, f'未知值（{value}）')
+
+
+def _app_web_restriction_text(value: int) -> str:
+    return '默认（未验证）' if value == 0 else f'未验证（{value}）'
+
 
 def upload_file(host: str, port: int, path: str):
     """按需加载独立上传工具，避免导入 student_core 时连到教师 MiniMedia。"""
@@ -83,6 +100,23 @@ class PendingSubmission:
     paths: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class BehaviorRestrictions:
+    """COMD 0x200/0x17 行为限制取值；模拟端只记录，不执行任何限制。"""
+    app: int = 0
+    web: int = 0
+    usb: int = 0
+    cdrom: int = 0
+    printer: int = 0
+
+    def summary(self) -> str:
+        return (f'App {_app_web_restriction_text(self.app)}，'
+                f'Web {_app_web_restriction_text(self.web)}，'
+                f'U盘 {_device_restriction_text(self.usb)}，'
+                f'光驱 {_device_restriction_text(self.cdrom)}，'
+                f'打印 {_printer_restriction_text(self.printer)}')
+
+
 @dataclass
 class StudentState:
     online: bool = False
@@ -97,12 +131,18 @@ class StudentState:
     student_demo: bool = False
     remote_view: bool = False
     remote_control: bool = False
+    restrictions: BehaviorRestrictions | None = None
     pending_submission: PendingSubmission | None = None
     submission_status: str = 'idle'
     submission_detail: str = '尚未发送文件提交请求'
     last_teacher_packet: float = 0.0
     requested_channel: int | None = None
     requested_auto_login: int | None = None
+
+    def restrictions_summary(self) -> str:
+        if self.restrictions is None:
+            return '无（尚未收到 COMD 0x200/0x17）'
+        return self.restrictions.summary()
 
     def status_lines(self, config: StudentConfig, execute: bool) -> list[str]:
         pending = self.pending_submission
@@ -129,6 +169,7 @@ class StudentState:
             f'黑屏：{"是（仅提示）" if self.blackscreen else "否"}；举手：{"是" if self.hand_up else "否"}',
             f'广播：{"是" if self.screen_broadcast else "否"}；演示：{"是（仅提示）" if self.student_demo else "否"}；'
             f'观看：{"是" if self.remote_view else "否"}；远控请求：{"是（不执行）" if self.remote_control else "否"}',
+            f'行为限制：{self.restrictions_summary()}（仅记录，不执行）',
             f'文件提交：{self.submission_status}；{self.submission_detail}',
             f'待回复请求：{pending_text}',
             f'动作模式：{"受限白名单" if execute else "观察（全部仅记录）"}',
@@ -466,6 +507,9 @@ class StudentMachine:
         if category != 0x200:
             self.observe_only('COMD 非应用命令', f'category=0x{category:X}, command=0x{command:X}')
             return
+        if command_id == RESTRICTIONS_COMMAND_ID:
+            self._handle_restrictions(payload)
+            return
         if command_id == 0x0F and len(payload) >= 852:
             path = protocol.decode_wstr(payload[20:532])
             args = protocol.decode_wstr(payload[532:852])
@@ -482,6 +526,16 @@ class StudentMachine:
             self.observe_only('黑屏/锁屏控制', f'lock={lock}；不会锁定输入或屏幕')
         else:
             self.observe_only('其他应用命令', f'cmd=0x{command:08X}')
+
+    def _handle_restrictions(self, payload: bytes) -> None:
+        if len(payload) < RESTRICTIONS_PAYLOAD_SIZE:
+            self.observe_only('行为限制命令',
+                              f'负载 {len(payload)} 字节，不足 '
+                              f'{RESTRICTIONS_PAYLOAD_SIZE} 字节；不解析、不写入状态')
+            return
+        self.state.restrictions = BehaviorRestrictions(*struct.unpack_from('<5I', payload, 12))
+        self.event('行为限制',
+                   f'{self.state.restrictions_summary()}；仅记录，不执行任何限制或系统动作')
 
     def handle_packet(self, data: bytes, via: str, source_ip: str = '') -> None:
         if len(data) < 4:

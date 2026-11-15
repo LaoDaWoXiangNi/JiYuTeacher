@@ -1858,6 +1858,137 @@ def stop_student_demo(source_ip=None):
     return True
 
 
+# 抢答 / 随堂小考 / 快速测评的模块启停：StudentMain 在 MESS 内层 payload
+# +0x14 取 feature、+0x18 取 flags（0x10000000=停止），见 temp/quiz-findings.md
+# §4.1 的反汇编表。这里只发启停控制面：题目、评分、奖励的数据面未闭合，
+# 不构造 DMCQ/KLBQ/AAPR 等命令包。
+MODULE_FEATURE_RESPONSE = 0x80000
+MODULE_FEATURE_QUIZ = 0x400000
+MODULE_FEATURE_INSTANT = 0x4000000
+MODULE_FEATURES = {
+    'response': (MODULE_FEATURE_RESPONSE, '抢答竞赛'),
+    'quiz': (MODULE_FEATURE_QUIZ, '随堂小考'),
+    'instant': (MODULE_FEATURE_INSTANT, '快速测评'),
+}
+active_module_features = {}   # feature -> {'since': ts}
+
+
+def build_module_feature_payload(feature, enabled):
+    """构造模块启停的 MESS 内层 payload（结构性复用 feature 4 的布局）。"""
+    if feature not in (MODULE_FEATURE_RESPONSE, MODULE_FEATURE_QUIZ,
+                       MODULE_FEATURE_INSTANT):
+        raise ValueError(f'不支持的模块 feature=0x{feature:X}')
+    flags = 0 if enabled else 0x10000000
+    payload = struct.pack('<IIIIIII', 29, 1, 0, 0, 0, feature, flags) + b'\x00'
+    if len(payload) != 29:
+        raise AssertionError('模块启停 payload 长度错误')
+    return payload
+
+
+def send_module_feature(module, enabled, recipients=None):
+    """向学生单播模块启停包；module 取 response / quiz / instant。
+
+    只发送已证实的 feature/停止位，不带任何题目或媒体参数。学生端是否
+    创建客户端、以及后续交互均未实机验证。
+    """
+    if module not in MODULE_FEATURES:
+        raise ValueError(f'未知模块：{module}')
+    feature, name = MODULE_FEATURES[module]
+    if recipients is None:
+        recipients = list(students)
+    elif isinstance(recipients, str):
+        recipients = [recipients]
+    recipients = [sip for sip in dict.fromkeys(recipients) if sip in students]
+    if not recipients:
+        logger.warning('[模块] %s %s：没有可发送的在线学生', name,
+                       '启动' if enabled else '停止')
+        return {'ok': False, 'reason': '没有可发送的在线学生',
+                'sent': 0, 'failed': []}
+    payload = build_module_feature_payload(feature, enabled)
+    state_text = 'start' if enabled else 'stop'
+    sent, failed = [], []
+    for sip in recipients:
+        label = f'{name} feature 0x{feature:X} {state_text}'
+        if _send_session(build_mess_packet(sip, payload), (sip, SPORT), label,
+                         allow_when_stopped=not enabled):
+            sent.append(sip)
+        else:
+            failed.append(sip)
+    if enabled and sent:
+        active_module_features[feature] = {'since': time.time(),
+                                           'recipients': sent}
+    elif not enabled:
+        active_module_features.pop(feature, None)
+    logger.info('[模块] %s %s -> %d 台成功，%d 台失败%s',
+                name, '启动' if enabled else '停止', len(sent), len(failed),
+                f'，失败={failed}' if failed else '')
+    return {'ok': bool(sent) and not failed, 'sent': len(sent),
+            'failed': failed, 'feature': f'0x{feature:X}'}
+
+
+# 行为限制：COMD 事件 0x80000010 / category=0x200 / command_id=0x17。
+# 取值语义见 temp/policy-enums-findings.md：
+#   U 盘/光驱 +0x14/+0x18 只有 0..3 已证实（Free/Readonly/NoExecute/Block），
+#   打印 +0x1c 只有 0（不限制）与 2（全部禁止）已证实，1/3 学生端 no-op；
+#   App +0x0c / Web +0x10 学生端不校验不解释，1/2/3 语义未知。
+# 学生端收到后只做“比较→保存→广播→调策略函数”，没有任何结果回执。
+BEHAVIOR_RESTRICTION_GUID = 'f96a6d195b2946b9ab958a143ecddc26'
+
+
+def send_behavior_restrictions(recipients, app=0, web=0, usb=0, cd=0, printer=0):
+    """下发行为限制（COMD 0x80000010 / category=0x200 / command_id=0x17）。
+
+    内层 payload 32 字节，逐学生单播到主通道端口：
+      +0x00 category=0x200  +0x04 flags=0  +0x08 command=0x17
+      +0x0c App  +0x10 Web  +0x14 U 盘  +0x18 光驱  +0x1c 打印
+    与关机包一致，外层 COMD 的 payload 末尾再补 4 字节 NUL。
+
+    recipients 可以是单个 IP 字符串或 IP 列表；未登录的 IP 会被过滤掉。
+    restrictions 模块采用惰性导入：文件缺失时本函数返回失败结果，而不是让
+    整个进程在 import 阶段起不来。
+    """
+    try:
+        import restrictions
+    except Exception as error:  # pragma: no cover - 只在模块缺失/损坏时触发
+        logger.error('[行为限制] restrictions 模块不可用，拒绝发送：%s', error)
+        return {'ok': False, 'reason': f'restrictions 模块不可用：{error}',
+                'sent': 0, 'failed': [], 'skipped': [], 'summary': '未发送'}
+    payload = restrictions.build_restriction_payload(
+        app=app, web=web, usb=usb, cd=cd, printer=printer)
+    summary = restrictions.describe_restrictions({
+        'app': app, 'web': web, 'usb': usb, 'cd': cd, 'printer': printer})
+    if recipients is None:
+        requested = list(students)
+    elif isinstance(recipients, str):
+        requested = [recipients]
+    else:
+        requested = list(recipients)
+    requested = list(dict.fromkeys(requested))
+    targets = [sip for sip in requested if sip in students]
+    skipped = [sip for sip in requested if sip not in students]
+    if skipped:
+        logger.warning('[行为限制] 跳过未登录学生 %s', skipped)
+    if not targets:
+        logger.warning('[行为限制] 没有可发送的在线学生 policy=%s', summary)
+        return {'ok': False, 'reason': '没有可发送的在线学生', 'sent': 0,
+                'failed': [], 'skipped': skipped, 'summary': summary}
+    pkt = build_comd_command_ex(0x80000010, payload + b'\x00' * 4,
+                               BEHAVIOR_RESTRICTION_GUID)
+    sent, failed = [], []
+    for sip in targets:
+        if _send_main(pkt, (sip, PORT), 'BehaviorRestriction COMD 0x17'):
+            sent.append(sip)
+        else:
+            failed.append(sip)
+    logger.info('[行为限制] %s -> %d 台成功，%d 台失败%s%s', summary,
+                len(sent), len(failed),
+                f'，失败={failed}' if failed else '',
+                f'，跳过={skipped}' if skipped else '')
+    return {'ok': bool(sent) and not failed, 'sent': len(sent),
+            'failed': failed, 'skipped': skipped, 'summary': summary,
+            'payload_size': len(payload)}
+
+
 class RemoteViewSession:
     """V6 TCP/UMSP channel 10 接收器及 libTDDesk2 桌面帧重组器。"""
 

@@ -73,9 +73,13 @@ REMOTE_FIELD_OFFSETS = {
 STATE_FIELDS = (
     'online', 'login_replies', 'blackscreen', 'blackscreen_text', 'lock_requested',
     'hand_up', 'preview_enabled', 'preview_version', 'screen_broadcast',
-    'student_demo', 'remote_view', 'remote_control', 'pending_submission',
-    'submission_status', 'submission_detail',
+    'student_demo', 'remote_view', 'remote_control', 'restrictions',
+    'pending_submission', 'submission_status', 'submission_detail',
 )
+
+RESTRICTIONS_SUMMARY = ('App 未验证（1），Web 未验证（2），U盘 完全禁止，'
+                        '光驱 禁止执行，打印 全部禁止')
+RESTRICTIONS_VALUES = (1, 2, 3, 2, 2)
 
 
 def state_snapshot(machine):
@@ -816,6 +820,73 @@ def run_self_test() -> int:
         assert '请求的频道/自动登录' in student_sim.CLI_HELP
         assert '远程频道/自动登录' in inspect.getsource(student_sim.run_gui)
 
+    def restrictions_command_state_and_status():
+        machine, sent, events = make_machine()
+        assert student_core.RESTRICTIONS_COMMAND_ID == 0x17
+        assert student_core.RESTRICTIONS_PAYLOAD_SIZE == 0x20
+        packet = app_packet(0x17, struct.pack('<5I', *RESTRICTIONS_VALUES))
+        cmd_code, _, payload = protocol.parse_comd(packet)
+        assert cmd_code == 0x80000010 and len(payload) == 0x20
+        assert struct.unpack_from('<III', payload) == (0x200, 0, 0x17)
+        assert struct.unpack_from('<5I', payload, 12) == RESTRICTIONS_VALUES
+        assert machine.state.restrictions is None
+        assert '行为限制：无（尚未收到 COMD 0x200/0x17）' in '\n'.join(
+            machine.state.status_lines(machine.config, False))
+        with mock.patch.object(student_core.subprocess, 'Popen') as popen, \
+                mock.patch.object(student_core.webbrowser, 'open') as browser:
+            machine.handle_packet(packet, 'main', machine.config.teacher_ip)
+            popen.assert_not_called()
+            browser.assert_not_called()
+        assert machine.state.restrictions == student_core.BehaviorRestrictions(
+            *RESTRICTIONS_VALUES)
+        assert machine.state.restrictions_summary() == RESTRICTIONS_SUMMARY
+        assert any(kind == '行为限制' and text.startswith(RESTRICTIONS_SUMMARY)
+                   and '仅记录' in text for kind, text in events)
+        status = '\n'.join(machine.state.status_lines(machine.config, False))
+        assert f'行为限制：{RESTRICTIONS_SUMMARY}（仅记录，不执行）' in status
+        assert not sent
+        machine.handle_packet(app_packet(0x17, struct.pack('<5I', 0, 0, 0, 1, 0)), 'main',
+                              machine.config.teacher_ip)
+        assert machine.state.restrictions == student_core.BehaviorRestrictions(0, 0, 0, 1, 0)
+        assert machine.state.restrictions_summary() == (
+            'App 默认（未验证），Web 默认（未验证），U盘 开放，光驱 只读，打印 不限制')
+        machine.handle_packet(app_packet(0x17, struct.pack('<5I', 1, 1, 4, 5, 1)), 'main',
+                              machine.config.teacher_ip)
+        summary = machine.state.restrictions_summary()
+        assert 'U盘 未知值（4）' in summary and '光驱 未知值（5）' in summary, summary
+        assert '打印 未知值（1）' in summary and 'App 未验证（1）' in summary, summary
+
+    def restrictions_truncated_payload():
+        full = struct.pack('<5I', *RESTRICTIONS_VALUES)
+        for extra_length in (0, 4, 8, 12, 16, 19):
+            machine, sent, events = make_machine(execute=True)
+            payload_length = 12 + extra_length
+            packet = app_packet(0x17, full[:extra_length])
+            with mock.patch.object(student_core.subprocess, 'Popen') as popen, \
+                    mock.patch.object(student_core.webbrowser, 'open') as browser:
+                machine.handle_packet(packet, 'main', machine.config.teacher_ip)
+                popen.assert_not_called()
+                browser.assert_not_called()
+            assert machine.state.restrictions is None, payload_length
+            assert not any(kind == '行为限制' for kind, _ in events), payload_length
+            assert any(kind == '仅提示' and '行为限制命令' in text
+                       and f'负载 {payload_length} 字节' in text and '不足 32 字节' in text
+                       for kind, text in events), payload_length
+            status = '\n'.join(machine.state.status_lines(machine.config, False))
+            assert '行为限制：无（尚未收到 COMD 0x200/0x17）' in status, payload_length
+            assert not sent, payload_length
+        machine, _, events = make_machine()
+        machine.handle_packet(app_packet(0x17, full), 'main', machine.config.teacher_ip)
+        recorded = machine.state.restrictions
+        assert recorded is not None
+        for packet in (app_packet(0x17, full[:16]),
+                       app_packet(0x17, full)[:-4],
+                       app_packet(0x17, full)[:43]):
+            machine.handle_packet(packet, 'main', machine.config.teacher_ip)
+        assert machine.state.restrictions == recorded
+        assert '行为限制：' + RESTRICTIONS_SUMMARY in '\n'.join(
+            machine.state.status_lines(machine.config, False))
+
     def cli_gui_upload_options():
         try:
             from . import student_sim
@@ -878,6 +949,8 @@ def run_self_test() -> int:
          remote_channel_no_side_effects),
         ('远程频道设置不改变默认危险动作约束', remote_channel_keeps_dangerous_defaults),
         ('CLI/GUI 状态与时间线可见', remote_channel_cli_gui_visible),
+        ('行为限制 COMD 0x200/0x17 解析与状态行', restrictions_command_state_and_status),
+        ('行为限制截断负载只提示不抛异常', restrictions_truncated_payload),
         ('CLI/GUI 上传参数与状态行', cli_gui_upload_options),
     ):
         check(name, function)

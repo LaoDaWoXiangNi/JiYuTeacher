@@ -65,6 +65,9 @@ def build():
         '--add-binary', f'{bundled_ffmpeg}{separator}.',
         '--add-data', f'{bundled_font}{separator}fonts',
         '--hidden-import', 'PIL.ImageTk',
+        # teacher_sim.send_behavior_restrictions 里是惰性 import，
+        # 显式声明避免打包后运行到该分支才报 ModuleNotFoundError。
+        '--hidden-import', 'restrictions',
         '--exclude-module', 'cv2',
         '--exclude-module', 'numpy',
         'teacher_gui.py',
